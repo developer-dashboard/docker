@@ -13,6 +13,9 @@ var (
 		&ResourceFilter{},
 		&PluginFilter{},
 		&ConstraintFilter{},
+		&PlatformFilter{},
+		&HostPortFilter{},
+		&MaxReplicasFilter{},
 	}
 )
 

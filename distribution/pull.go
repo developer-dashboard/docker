@@ -1,17 +1,19 @@
-package distribution
+package distribution // import "github.com/docker/docker/distribution"
 
 import (
-	"errors"
+	"context"
 	"fmt"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/docker/distribution/digest"
+	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api"
 	"github.com/docker/docker/distribution/metadata"
 	"github.com/docker/docker/pkg/progress"
-	"github.com/docker/docker/reference"
+	refstore "github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
-	"golang.org/x/net/context"
+	"github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // Puller is an interface that abstracts pulling for different API versions.
@@ -19,7 +21,7 @@ type Puller interface {
 	// Pull tries to pull the image referenced by `tag`
 	// Pull returns an error if any, as well as a boolean that determines whether to retry Pull on the next configured endpoint.
 	//
-	Pull(ctx context.Context, ref reference.Named) error
+	Pull(ctx context.Context, ref reference.Named, platform *specs.Platform) error
 }
 
 // newPuller returns a Puller interface that will pull from either a v1 or v2
@@ -37,12 +39,7 @@ func newPuller(endpoint registry.APIEndpoint, repoInfo *registry.RepositoryInfo,
 			repoInfo:          repoInfo,
 		}, nil
 	case registry.APIVersion1:
-		return &v1Puller{
-			v1IDService: metadata.NewV1IDService(imagePullConfig.MetadataStore),
-			endpoint:    endpoint,
-			config:      imagePullConfig,
-			repoInfo:    repoInfo,
-		}, nil
+		return nil, fmt.Errorf("protocol version %d no longer supported. Please contact admins of registry %s", endpoint.Version, endpoint.URL)
 	}
 	return nil, fmt.Errorf("unknown version %d for registry %s", endpoint.Version, endpoint.URL)
 }
@@ -56,12 +53,12 @@ func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullCo
 		return err
 	}
 
-	// makes sure name is not empty or `scratch`
-	if err := ValidateRepoName(repoInfo.Name()); err != nil {
+	// makes sure name is not `scratch`
+	if err := ValidateRepoName(repoInfo.Name); err != nil {
 		return err
 	}
 
-	endpoints, err := imagePullConfig.RegistryService.LookupPullEndpoints(repoInfo.Hostname())
+	endpoints, err := imagePullConfig.RegistryService.LookupPullEndpoints(reference.Domain(repoInfo.Name))
 	if err != nil {
 		return err
 	}
@@ -105,14 +102,15 @@ func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullCo
 			}
 		}
 
-		logrus.Debugf("Trying to pull %s from %s %s", repoInfo.Name(), endpoint.URL, endpoint.Version)
+		logrus.Debugf("Trying to pull %s from %s %s", reference.FamiliarName(repoInfo.Name), endpoint.URL, endpoint.Version)
 
 		puller, err := newPuller(endpoint, repoInfo, imagePullConfig)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		if err := puller.Pull(ctx, ref); err != nil {
+
+		if err := puller.Pull(ctx, ref, imagePullConfig.Platform); err != nil {
 			// Was this pull cancelled? If so, don't try to fall
 			// back.
 			fallback := false
@@ -140,19 +138,19 @@ func Pull(ctx context.Context, ref reference.Named, imagePullConfig *ImagePullCo
 					// append subsequent errors
 					lastErr = err
 				}
-				logrus.Errorf("Attempting next endpoint for pull after error: %v", err)
+				logrus.Infof("Attempting next endpoint for pull after error: %v", err)
 				continue
 			}
 			logrus.Errorf("Not continuing with pull after error: %v", err)
 			return TranslatePullError(err, ref)
 		}
 
-		imagePullConfig.ImageEventLogger(ref.String(), repoInfo.Name(), "pull")
+		imagePullConfig.ImageEventLogger(reference.FamiliarString(ref), reference.FamiliarName(repoInfo.Name), "pull")
 		return nil
 	}
 
 	if lastErr == nil {
-		lastErr = fmt.Errorf("no endpoints found for %s", ref.String())
+		lastErr = fmt.Errorf("no endpoints found for %s", reference.FamiliarString(ref))
 	}
 
 	return TranslatePullError(lastErr, ref)
@@ -171,17 +169,14 @@ func writeStatus(requestedTag string, out progress.Output, layersDownloaded bool
 }
 
 // ValidateRepoName validates the name of a repository.
-func ValidateRepoName(name string) error {
-	if name == "" {
-		return errors.New("Repository name can't be empty")
-	}
-	if name == api.NoBaseImageSpecifier {
-		return fmt.Errorf("'%s' is a reserved name", api.NoBaseImageSpecifier)
+func ValidateRepoName(name reference.Named) error {
+	if reference.FamiliarName(name) == api.NoBaseImageSpecifier {
+		return errors.WithStack(reservedNameError(api.NoBaseImageSpecifier))
 	}
 	return nil
 }
 
-func addDigestReference(store reference.Store, ref reference.Named, dgst digest.Digest, id digest.Digest) error {
+func addDigestReference(store refstore.Store, ref reference.Named, dgst digest.Digest, id digest.Digest) error {
 	dgstRef, err := reference.WithDigest(reference.TrimNamed(ref), dgst)
 	if err != nil {
 		return err
@@ -193,7 +188,7 @@ func addDigestReference(store reference.Store, ref reference.Named, dgst digest.
 			logrus.Errorf("Image ID for digest %s changed from %s to %s, cannot update", dgst.String(), oldTagID, id)
 		}
 		return nil
-	} else if err != reference.ErrDoesNotExist {
+	} else if err != refstore.ErrDoesNotExist {
 		return err
 	}
 

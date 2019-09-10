@@ -79,6 +79,9 @@ func (r *Raw) UnmarshalMsg(b []byte) ([]byte, error) {
 		return b, err
 	}
 	rlen := l - len(out)
+	if IsNil(b[:rlen]) {
+		rlen = 0
+	}
 	if cap(*r) < rlen {
 		*r = make(Raw, rlen)
 	} else {
@@ -104,7 +107,11 @@ func (r Raw) EncodeMsg(w *Writer) error {
 // next object on the wire.
 func (r *Raw) DecodeMsg(f *Reader) error {
 	*r = (*r)[:0]
-	return appendNext(f, (*[]byte)(r))
+	err := appendNext(f, (*[]byte)(r))
+	if IsNil(*r) {
+		*r = (*r)[:0]
+	}
+	return err
 }
 
 // Msgsize implements msgp.Sizer
@@ -117,13 +124,13 @@ func (r Raw) Msgsize() int {
 }
 
 func appendNext(f *Reader, d *[]byte) error {
-	amt, o, err := getNextSize(f.r)
+	amt, o, err := getNextSize(f.R)
 	if err != nil {
 		return err
 	}
 	var i int
 	*d, i = ensure(*d, int(amt))
-	_, err = f.r.ReadFull((*d)[i:])
+	_, err = f.R.ReadFull((*d)[i:])
 	if err != nil {
 		return err
 	}
@@ -368,12 +375,30 @@ func ReadInt64Bytes(b []byte) (i int64, o []byte, err error) {
 		o = b[2:]
 		return
 
+	case muint8:
+		if l < 2 {
+			err = ErrShortBytes
+			return
+		}
+		i = int64(getMuint8(b))
+		o = b[2:]
+		return
+
 	case mint16:
 		if l < 3 {
 			err = ErrShortBytes
 			return
 		}
 		i = int64(getMint16(b))
+		o = b[3:]
+		return
+
+	case muint16:
+		if l < 3 {
+			err = ErrShortBytes
+			return
+		}
+		i = int64(getMuint16(b))
 		o = b[3:]
 		return
 
@@ -386,12 +411,35 @@ func ReadInt64Bytes(b []byte) (i int64, o []byte, err error) {
 		o = b[5:]
 		return
 
+	case muint32:
+		if l < 5 {
+			err = ErrShortBytes
+			return
+		}
+		i = int64(getMuint32(b))
+		o = b[5:]
+		return
+
 	case mint64:
 		if l < 9 {
 			err = ErrShortBytes
 			return
 		}
-		i = getMint64(b)
+		i = int64(getMint64(b))
+		o = b[9:]
+		return
+
+	case muint64:
+		if l < 9 {
+			err = ErrShortBytes
+			return
+		}
+		u := getMuint64(b)
+		if u > math.MaxInt64 {
+			err = UintOverflow{Value: u, FailedBitsize: 64}
+			return
+		}
+		i = int64(u)
 		o = b[9:]
 		return
 
@@ -477,6 +525,20 @@ func ReadUint64Bytes(b []byte) (u uint64, o []byte, err error) {
 	}
 
 	switch lead {
+	case mint8:
+		if l < 2 {
+			err = ErrShortBytes
+			return
+		}
+		v := int64(getMint8(b))
+		if v < 0 {
+			err = UintBelowZero{Value: v}
+			return
+		}
+		u = uint64(v)
+		o = b[2:]
+		return
+
 	case muint8:
 		if l < 2 {
 			err = ErrShortBytes
@@ -484,6 +546,20 @@ func ReadUint64Bytes(b []byte) (u uint64, o []byte, err error) {
 		}
 		u = uint64(getMuint8(b))
 		o = b[2:]
+		return
+
+	case mint16:
+		if l < 3 {
+			err = ErrShortBytes
+			return
+		}
+		v := int64(getMint16(b))
+		if v < 0 {
+			err = UintBelowZero{Value: v}
+			return
+		}
+		u = uint64(v)
+		o = b[3:]
 		return
 
 	case muint16:
@@ -495,6 +571,20 @@ func ReadUint64Bytes(b []byte) (u uint64, o []byte, err error) {
 		o = b[3:]
 		return
 
+	case mint32:
+		if l < 5 {
+			err = ErrShortBytes
+			return
+		}
+		v := int64(getMint32(b))
+		if v < 0 {
+			err = UintBelowZero{Value: v}
+			return
+		}
+		u = uint64(v)
+		o = b[5:]
+		return
+
 	case muint32:
 		if l < 5 {
 			err = ErrShortBytes
@@ -502,6 +592,20 @@ func ReadUint64Bytes(b []byte) (u uint64, o []byte, err error) {
 		}
 		u = uint64(getMuint32(b))
 		o = b[5:]
+		return
+
+	case mint64:
+		if l < 9 {
+			err = ErrShortBytes
+			return
+		}
+		v := int64(getMint64(b))
+		if v < 0 {
+			err = UintBelowZero{Value: v}
+			return
+		}
+		u = uint64(v)
+		o = b[9:]
 		return
 
 	case muint64:
@@ -514,7 +618,11 @@ func ReadUint64Bytes(b []byte) (u uint64, o []byte, err error) {
 		return
 
 	default:
-		err = badPrefix(UintType, lead)
+		if isnfixint(lead) {
+			err = UintBelowZero{Value: int64(rnfixint(lead))}
+		} else {
+			err = badPrefix(UintType, lead)
+		}
 		return
 	}
 }
@@ -576,7 +684,7 @@ func ReadUintBytes(b []byte) (uint, []byte, error) {
 	return uint(u), b, err
 }
 
-// ReadByteBytes is analagous to ReadUint8Bytes
+// ReadByteBytes is analogous to ReadUint8Bytes
 func ReadByteBytes(b []byte) (byte, []byte, error) {
 	return ReadUint8Bytes(b)
 }
@@ -784,6 +892,22 @@ func ReadStringBytes(b []byte) (string, []byte, error) {
 	return string(v), o, err
 }
 
+// ReadStringAsBytes reads a 'str' object
+// into a slice of bytes. 'v' is the value of
+// the 'str' object, which may reside in memory
+// pointed to by 'scratch.' 'o' is the remaining bytes
+// in 'b.''
+// Possible errors:
+// - ErrShortBytes (b not long enough)
+// - TypeError{} (not 'str' type)
+// - InvalidPrefixError (unknown type marker)
+func ReadStringAsBytes(b []byte, scratch []byte) (v []byte, o []byte, err error) {
+	var tmp []byte
+	tmp, o, err = ReadStringZC(b)
+	v = append(scratch[:0], tmp...)
+	return
+}
+
 // ReadComplex128Bytes reads a complex128
 // extension object from 'b' and returns the
 // remaining bytes.
@@ -922,14 +1046,14 @@ func ReadIntfBytes(b []byte) (i interface{}, o []byte, err error) {
 
 	case ArrayType:
 		var sz uint32
-		sz, b, err = ReadArrayHeaderBytes(b)
+		sz, o, err = ReadArrayHeaderBytes(b)
 		if err != nil {
 			return
 		}
 		j := make([]interface{}, int(sz))
 		i = j
 		for d := range j {
-			j[d], b, err = ReadIntfBytes(b)
+			j[d], o, err = ReadIntfBytes(o)
 			if err != nil {
 				return
 			}

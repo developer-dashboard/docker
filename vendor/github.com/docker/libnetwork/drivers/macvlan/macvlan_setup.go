@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/ns"
+	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 )
 
@@ -30,7 +30,7 @@ func createMacVlan(containerIfName, parent, macvlanMode string) (string, error) 
 	// Get the link for the master index (Example: the docker host eth iface)
 	parentLink, err := ns.NlHandle().LinkByName(parent)
 	if err != nil {
-		return "", fmt.Errorf("error occoured looking up the %s parent iface %s error: %s", macvlanType, parent, err)
+		return "", fmt.Errorf("error occurred looking up the %s parent iface %s error: %s", macvlanType, parent, err)
 	}
 	// Create a macvlan link
 	macvlan := &netlink.Macvlan{
@@ -173,7 +173,7 @@ func createDummyLink(dummyName, truncNetID string) error {
 	}
 	parentDummyLink, err := ns.NlHandle().LinkByName(dummyName)
 	if err != nil {
-		return fmt.Errorf("error occoured looking up the %s parent iface %s error: %s", macvlanType, dummyName, err)
+		return fmt.Errorf("error occurred looking up the %s parent iface %s error: %s", macvlanType, dummyName, err)
 	}
 	// bring the new netlink iface up
 	if err := ns.NlHandle().LinkSetUp(parentDummyLink); err != nil {
@@ -205,5 +205,5 @@ func delDummyLink(linkName string) error {
 
 // getDummyName returns the name of a dummy parent with truncated net ID and driver prefix
 func getDummyName(netID string) string {
-	return fmt.Sprintf("%s%s", dummyPrefix, netID)
+	return dummyPrefix + netID
 }

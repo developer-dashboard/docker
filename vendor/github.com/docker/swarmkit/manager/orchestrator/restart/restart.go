@@ -2,18 +2,19 @@ package restart
 
 import (
 	"container/list"
+	"context"
 	"errors"
 	"sync"
 	"time"
 
 	"github.com/docker/go-events"
 	"github.com/docker/swarmkit/api"
+	"github.com/docker/swarmkit/api/defaults"
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/manager/orchestrator"
 	"github.com/docker/swarmkit/manager/state"
 	"github.com/docker/swarmkit/manager/state/store"
-	"github.com/docker/swarmkit/protobuf/ptypes"
-	"golang.org/x/net/context"
+	gogotypes "github.com/gogo/protobuf/types"
 )
 
 const defaultOldTaskTimeout = time.Minute
@@ -29,6 +30,13 @@ type instanceRestartInfo struct {
 	// Restart.MaxAttempts and Restart.Window are both
 	// nonzero.
 	restartedInstances *list.List
+	// Why is specVersion in this structure and not in the map key? While
+	// putting it in the key would be a very simple solution, it wouldn't
+	// be easy to clean up map entries corresponding to old specVersions.
+	// Making the key version-agnostic and clearing the value whenever the
+	// version changes avoids the issue of stale map entries for old
+	// versions.
+	specVersion api.Version
 }
 
 type delayedStart struct {
@@ -41,20 +49,13 @@ type delayedStart struct {
 	waiter bool
 }
 
-type instanceTuple struct {
-	instance  uint64 // unset for global tasks
-	serviceID string
-	nodeID    string // unset for replicated tasks
-}
-
 // Supervisor initiates and manages restarts. It's responsible for
 // delaying restarts when applicable.
 type Supervisor struct {
 	mu               sync.Mutex
 	store            *store.MemoryStore
 	delays           map[string]*delayedStart
-	history          map[instanceTuple]*instanceRestartInfo
-	historyByService map[string]map[instanceTuple]struct{}
+	historyByService map[string]map[orchestrator.SlotTuple]*instanceRestartInfo
 	TaskTimeout      time.Duration
 }
 
@@ -63,8 +64,7 @@ func NewSupervisor(store *store.MemoryStore) *Supervisor {
 	return &Supervisor{
 		store:            store,
 		delays:           make(map[string]*delayedStart),
-		history:          make(map[instanceTuple]*instanceRestartInfo),
-		historyByService: make(map[string]map[instanceTuple]struct{}),
+		historyByService: make(map[string]map[orchestrator.SlotTuple]*instanceRestartInfo),
 		TaskTimeout:      defaultOldTaskTimeout,
 	}
 }
@@ -156,13 +156,13 @@ func (r *Supervisor) Restart(ctx context.Context, tx store.Tx, cluster *api.Clus
 	if n == nil || n.Spec.Availability != api.NodeAvailabilityDrain {
 		if t.Spec.Restart != nil && t.Spec.Restart.Delay != nil {
 			var err error
-			restartDelay, err = ptypes.Duration(t.Spec.Restart.Delay)
+			restartDelay, err = gogotypes.DurationFromProto(t.Spec.Restart.Delay)
 			if err != nil {
 				log.G(ctx).WithError(err).Error("invalid restart delay; using default")
-				restartDelay = orchestrator.DefaultRestartDelay
+				restartDelay, _ = gogotypes.DurationFromProto(defaults.Service.Task.Restart.Delay)
 			}
 		} else {
-			restartDelay = orchestrator.DefaultRestartDelay
+			restartDelay, _ = gogotypes.DurationFromProto(defaults.Service.Task.Restart.Delay)
 		}
 	}
 
@@ -179,19 +179,33 @@ func (r *Supervisor) Restart(ctx context.Context, tx store.Tx, cluster *api.Clus
 		return err
 	}
 
-	r.recordRestartHistory(restartTask)
+	tuple := orchestrator.SlotTuple{
+		Slot:      restartTask.Slot,
+		ServiceID: restartTask.ServiceID,
+		NodeID:    restartTask.NodeID,
+	}
+	r.RecordRestartHistory(tuple, restartTask)
 
 	r.DelayStart(ctx, tx, &t, restartTask.ID, restartDelay, waitStop)
 	return nil
 }
 
+// shouldRestart returns true if a task should be restarted according to the
+// restart policy.
 func (r *Supervisor) shouldRestart(ctx context.Context, t *api.Task, service *api.Service) bool {
 	// TODO(aluzzardi): This function should not depend on `service`.
-
-	condition := orchestrator.RestartCondition(t)
-
-	if condition != api.RestartOnAny &&
-		(condition != api.RestartOnFailure || t.Status.State == api.TaskStateCompleted) {
+	// There are 3 possible restart policies.
+	switch orchestrator.RestartCondition(t) {
+	case api.RestartOnAny:
+		// we will be restarting, we just need to do a few more checks
+	case api.RestartOnFailure:
+		// we won't restart if the task is in TaskStateCompleted, as this is a
+		// not a failed state -- it indicates that the task exited with 0
+		if t.Status.State == api.TaskStateCompleted {
+			return false
+		}
+	case api.RestartOnNone:
+		// RestartOnNone means we just don't restart, ever
 		return false
 	}
 
@@ -199,22 +213,22 @@ func (r *Supervisor) shouldRestart(ctx context.Context, t *api.Task, service *ap
 		return true
 	}
 
-	instanceTuple := instanceTuple{
-		instance:  t.Slot,
-		serviceID: t.ServiceID,
+	instanceTuple := orchestrator.SlotTuple{
+		Slot:      t.Slot,
+		ServiceID: t.ServiceID,
 	}
 
-	// Instance is not meaningful for "global" tasks, so they need to be
+	// Slot is not meaningful for "global" tasks, so they need to be
 	// indexed by NodeID.
 	if orchestrator.IsGlobalService(service) {
-		instanceTuple.nodeID = t.NodeID
+		instanceTuple.NodeID = t.NodeID
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	restartInfo := r.history[instanceTuple]
-	if restartInfo == nil {
+	restartInfo := r.historyByService[t.ServiceID][instanceTuple]
+	if restartInfo == nil || (t.SpecVersion != nil && *t.SpecVersion != restartInfo.specVersion) {
 		return true
 	}
 
@@ -226,13 +240,37 @@ func (r *Supervisor) shouldRestart(ctx context.Context, t *api.Task, service *ap
 		return true
 	}
 
-	window, err := ptypes.Duration(t.Spec.Restart.Window)
+	window, err := gogotypes.DurationFromProto(t.Spec.Restart.Window)
 	if err != nil {
 		log.G(ctx).WithError(err).Error("invalid restart lookback window")
 		return restartInfo.totalRestarts < t.Spec.Restart.MaxAttempts
 	}
-	lookback := time.Now().Add(-window)
 
+	var timestamp time.Time
+	// Prefer the manager's timestamp over the agent's, since manager
+	// clocks are more trustworthy.
+	if t.Status.AppliedAt != nil {
+		timestamp, err = gogotypes.TimestampFromProto(t.Status.AppliedAt)
+		if err != nil {
+			log.G(ctx).WithError(err).Error("invalid task status AppliedAt timestamp")
+			return restartInfo.totalRestarts < t.Spec.Restart.MaxAttempts
+		}
+	} else {
+		// It's safe to call TimestampFromProto with a nil timestamp
+		timestamp, err = gogotypes.TimestampFromProto(t.Status.Timestamp)
+		if t.Status.Timestamp == nil || err != nil {
+			log.G(ctx).WithError(err).Error("invalid task completion timestamp")
+			return restartInfo.totalRestarts < t.Spec.Restart.MaxAttempts
+		}
+	}
+	lookback := timestamp.Add(-window)
+
+	numRestarts := uint64(restartInfo.restartedInstances.Len())
+
+	// Disregard any restarts that happened before the lookback window,
+	// and remove them from the linked list since they will no longer
+	// be relevant to figuring out if tasks should be restarted going
+	// forward.
 	var next *list.Element
 	for e := restartInfo.restartedInstances.Front(); e != nil; e = next {
 		next = e.Next()
@@ -241,51 +279,115 @@ func (r *Supervisor) shouldRestart(ctx context.Context, t *api.Task, service *ap
 			break
 		}
 		restartInfo.restartedInstances.Remove(e)
+		numRestarts--
 	}
 
-	numRestarts := uint64(restartInfo.restartedInstances.Len())
+	// Ignore restarts that didn't happen before the task we're looking at.
+	for e2 := restartInfo.restartedInstances.Back(); e2 != nil; e2 = e2.Prev() {
+		if e2.Value.(restartedInstance).timestamp.Before(timestamp) {
+			break
+		}
+		numRestarts--
+	}
 
-	if numRestarts == 0 {
+	if restartInfo.restartedInstances.Len() == 0 {
 		restartInfo.restartedInstances = nil
 	}
 
 	return numRestarts < t.Spec.Restart.MaxAttempts
 }
 
-func (r *Supervisor) recordRestartHistory(restartTask *api.Task) {
-	if restartTask.Spec.Restart == nil || restartTask.Spec.Restart.MaxAttempts == 0 {
+// UpdatableTasksInSlot returns the set of tasks that should be passed to the
+// updater from this slot, or an empty slice if none should be.  An updatable
+// slot has either at least one task that with desired state <= RUNNING, or its
+// most recent task has stopped running and should not be restarted. The latter
+// case is for making sure that tasks that shouldn't normally be restarted will
+// still be handled by rolling updates when they become outdated.  There is a
+// special case for rollbacks to make sure that a rollback always takes the
+// service to a converged state, instead of ignoring tasks with the original
+// spec that stopped running and shouldn't be restarted according to the
+// restart policy.
+func (r *Supervisor) UpdatableTasksInSlot(ctx context.Context, slot orchestrator.Slot, service *api.Service) orchestrator.Slot {
+	if len(slot) < 1 {
+		return nil
+	}
+
+	var updatable orchestrator.Slot
+	for _, t := range slot {
+		if t.DesiredState <= api.TaskStateRunning {
+			updatable = append(updatable, t)
+		}
+	}
+	if len(updatable) > 0 {
+		return updatable
+	}
+
+	if service.UpdateStatus != nil && service.UpdateStatus.State == api.UpdateStatus_ROLLBACK_STARTED {
+		return nil
+	}
+
+	// Find most recent task
+	byTimestamp := orchestrator.TasksByTimestamp(slot)
+	newestIndex := 0
+	for i := 1; i != len(slot); i++ {
+		if byTimestamp.Less(newestIndex, i) {
+			newestIndex = i
+		}
+	}
+
+	if !r.shouldRestart(ctx, slot[newestIndex], service) {
+		return orchestrator.Slot{slot[newestIndex]}
+	}
+	return nil
+}
+
+// RecordRestartHistory updates the historyByService map to reflect the restart
+// of restartedTask.
+func (r *Supervisor) RecordRestartHistory(tuple orchestrator.SlotTuple, replacementTask *api.Task) {
+	if replacementTask.Spec.Restart == nil || replacementTask.Spec.Restart.MaxAttempts == 0 {
 		// No limit on the number of restarts, so no need to record
 		// history.
 		return
-	}
-	tuple := instanceTuple{
-		instance:  restartTask.Slot,
-		serviceID: restartTask.ServiceID,
-		nodeID:    restartTask.NodeID,
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.history[tuple] == nil {
-		r.history[tuple] = &instanceRestartInfo{}
+	serviceID := replacementTask.ServiceID
+	if r.historyByService[serviceID] == nil {
+		r.historyByService[serviceID] = make(map[orchestrator.SlotTuple]*instanceRestartInfo)
+	}
+	if r.historyByService[serviceID][tuple] == nil {
+		r.historyByService[serviceID][tuple] = &instanceRestartInfo{}
 	}
 
-	restartInfo := r.history[tuple]
+	restartInfo := r.historyByService[serviceID][tuple]
+
+	if replacementTask.SpecVersion != nil && *replacementTask.SpecVersion != restartInfo.specVersion {
+		// This task has a different SpecVersion from the one we're
+		// tracking. Most likely, the service was updated. Past failures
+		// shouldn't count against the new service definition, so clear
+		// the history for this instance.
+		*restartInfo = instanceRestartInfo{
+			specVersion: *replacementTask.SpecVersion,
+		}
+	}
+
 	restartInfo.totalRestarts++
 
-	if r.historyByService[restartTask.ServiceID] == nil {
-		r.historyByService[restartTask.ServiceID] = make(map[instanceTuple]struct{})
-	}
-	r.historyByService[restartTask.ServiceID][tuple] = struct{}{}
-
-	if restartTask.Spec.Restart.Window != nil && (restartTask.Spec.Restart.Window.Seconds != 0 || restartTask.Spec.Restart.Window.Nanos != 0) {
+	if replacementTask.Spec.Restart.Window != nil && (replacementTask.Spec.Restart.Window.Seconds != 0 || replacementTask.Spec.Restart.Window.Nanos != 0) {
 		if restartInfo.restartedInstances == nil {
 			restartInfo.restartedInstances = list.New()
 		}
 
+		// it's okay to call TimestampFromProto with a nil argument
+		timestamp, err := gogotypes.TimestampFromProto(replacementTask.Meta.CreatedAt)
+		if replacementTask.Meta.CreatedAt == nil || err != nil {
+			timestamp = time.Now()
+		}
+
 		restartedInstance := restartedInstance{
-			timestamp: time.Now(),
+			timestamp: timestamp,
 		}
 
 		restartInfo.restartedInstances.PushBack(restartedInstance)
@@ -322,22 +424,24 @@ func (r *Supervisor) DelayStart(ctx context.Context, _ store.Tx, oldTask *api.Ta
 	var watch chan events.Event
 	cancelWatch := func() {}
 
-	if waitStop && oldTask != nil {
+	waitForTask := waitStop && oldTask != nil && oldTask.Status.State <= api.TaskStateRunning
+
+	if waitForTask {
 		// Wait for either the old task to complete, or the old task's
 		// node to become unavailable.
 		watch, cancelWatch = state.Watch(
 			r.store.WatchQueue(),
-			state.EventUpdateTask{
+			api.EventUpdateTask{
 				Task:   &api.Task{ID: oldTask.ID, Status: api.TaskStatus{State: api.TaskStateRunning}},
-				Checks: []state.TaskCheckFunc{state.TaskCheckID, state.TaskCheckStateGreaterThan},
+				Checks: []api.TaskCheckFunc{api.TaskCheckID, state.TaskCheckStateGreaterThan},
 			},
-			state.EventUpdateNode{
+			api.EventUpdateNode{
 				Node:   &api.Node{ID: oldTask.NodeID, Status: api.NodeStatus{State: api.NodeStatus_DOWN}},
-				Checks: []state.NodeCheckFunc{state.NodeCheckID, state.NodeCheckState},
+				Checks: []api.NodeCheckFunc{api.NodeCheckID, state.NodeCheckState},
 			},
-			state.EventDeleteNode{
+			api.EventDeleteNode{
 				Node:   &api.Node{ID: oldTask.NodeID},
-				Checks: []state.NodeCheckFunc{state.NodeCheckID},
+				Checks: []api.NodeCheckFunc{api.NodeCheckID},
 			},
 		)
 	}
@@ -363,7 +467,7 @@ func (r *Supervisor) DelayStart(ctx context.Context, _ store.Tx, oldTask *api.Ta
 			}
 		}
 
-		if waitStop && oldTask != nil {
+		if waitForTask {
 			select {
 			case <-watch:
 			case <-oldTaskTimer.C:
@@ -412,35 +516,18 @@ func (r *Supervisor) Cancel(taskID string) {
 	<-delay.doneCh
 }
 
-// CancelAll aborts all pending restarts and waits for any instances of
-// StartNow that have already triggered to complete.
+// CancelAll aborts all pending restarts
 func (r *Supervisor) CancelAll() {
-	var cancelled []delayedStart
-
 	r.mu.Lock()
 	for _, delay := range r.delays {
 		delay.cancel()
 	}
 	r.mu.Unlock()
-
-	for _, delay := range cancelled {
-		<-delay.doneCh
-	}
 }
 
 // ClearServiceHistory forgets restart history related to a given service ID.
 func (r *Supervisor) ClearServiceHistory(serviceID string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	tuples := r.historyByService[serviceID]
-	if tuples == nil {
-		return
-	}
-
 	delete(r.historyByService, serviceID)
-
-	for t := range tuples {
-		delete(r.history, t)
-	}
+	r.mu.Unlock()
 }

@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/ns"
+	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 )
 
@@ -30,7 +30,7 @@ func createIPVlan(containerIfName, parent, ipvlanMode string) (string, error) {
 	// Get the link for the master index (Example: the docker host eth iface)
 	parentLink, err := ns.NlHandle().LinkByName(parent)
 	if err != nil {
-		return "", fmt.Errorf("error occoured looking up the %s parent iface %s error: %s", ipvlanType, parent, err)
+		return "", fmt.Errorf("error occurred looking up the %s parent iface %s error: %s", ipvlanType, parent, err)
 	}
 	// Create an ipvlan link
 	ipvlan := &netlink.IPVlan{
@@ -150,7 +150,7 @@ func parseVlan(linkName string) (string, int, error) {
 	}
 	// Check if the interface exists
 	if !parentExists(parent) {
-		return "", 0, fmt.Errorf("-o parent interface does was not found on the host: %s", parent)
+		return "", 0, fmt.Errorf("-o parent interface was not found on the host: %s", parent)
 	}
 
 	return parent, vidInt, nil
@@ -169,7 +169,7 @@ func createDummyLink(dummyName, truncNetID string) error {
 	}
 	parentDummyLink, err := ns.NlHandle().LinkByName(dummyName)
 	if err != nil {
-		return fmt.Errorf("error occoured looking up the %s parent iface %s error: %s", ipvlanType, dummyName, err)
+		return fmt.Errorf("error occurred looking up the %s parent iface %s error: %s", ipvlanType, dummyName, err)
 	}
 	// bring the new netlink iface up
 	if err := ns.NlHandle().LinkSetUp(parentDummyLink); err != nil {
@@ -201,5 +201,5 @@ func delDummyLink(linkName string) error {
 
 // getDummyName returns the name of a dummy parent with truncated net ID and driver prefix
 func getDummyName(netID string) string {
-	return fmt.Sprintf("%s%s", dummyPrefix, netID)
+	return dummyPrefix + netID
 }

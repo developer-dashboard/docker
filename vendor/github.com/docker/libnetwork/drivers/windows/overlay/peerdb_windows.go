@@ -6,40 +6,13 @@ import (
 
 	"encoding/json"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/docker/libnetwork/types"
+	"github.com/sirupsen/logrus"
 
 	"github.com/Microsoft/hcsshim"
-	"github.com/docker/libnetwork/types"
 )
 
 const ovPeerTable = "overlay_peer_table"
-
-func (d *driver) pushLocalDb() {
-	if !d.isSerfAlive() {
-		return
-	}
-
-	d.Lock()
-	networks := d.networks
-	d.Unlock()
-
-	for _, n := range networks {
-		n.Lock()
-		endpoints := n.endpoints
-		n.Unlock()
-
-		for _, ep := range endpoints {
-			if !ep.remote {
-				d.notifyCh <- ovNotify{
-					action: "join",
-					nw:     n,
-					ep:     ep,
-				}
-
-			}
-		}
-	}
-}
 
 func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 	peerMac net.HardwareAddr, vtep net.IP, updateDb bool) error {
@@ -59,7 +32,8 @@ func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 		logrus.Info("WINOVERLAY: peerAdd: notifying HNS of the REMOTE endpoint")
 
 		hnsEndpoint := &hcsshim.HNSEndpoint{
-			VirtualNetwork:   n.hnsId,
+			Name:             eid,
+			VirtualNetwork:   n.hnsID,
 			MacAddress:       peerMac.String(),
 			IPAddress:        peerIP,
 			IsRemoteEndpoint: true,
@@ -81,7 +55,7 @@ func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 			return err
 		}
 
-		// Temp: We have to create a endpoint object to keep track of the HNS ID for
+		// Temp: We have to create an endpoint object to keep track of the HNS ID for
 		// this endpoint so that we can retrieve it later when the endpoint is deleted.
 		// This seems unnecessary when we already have dockers EID. See if we can pass
 		// the global EID to HNS to use as it's ID, rather than having each HNS assign
@@ -93,8 +67,7 @@ func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 		}
 
 		n.removeEndpointWithAddress(addr)
-
-		hnsresponse, err := hcsshim.HNSEndpointRequest("POST", "", string(configurationb))
+		hnsresponse, err := endpointRequest("POST", "", string(configurationb))
 		if err != nil {
 			return err
 		}
@@ -104,15 +77,11 @@ func (d *driver) peerAdd(nid, eid string, peerIP net.IP, peerIPMask net.IPMask,
 			nid:       nid,
 			addr:      addr,
 			mac:       peerMac,
-			profileId: hnsresponse.Id,
+			profileID: hnsresponse.Id,
 			remote:    true,
 		}
 
 		n.addEndpoint(ep)
-
-		if err := d.writeEndpointToStore(ep); err != nil {
-			return fmt.Errorf("failed to update overlay endpoint %s to local store: %v", ep.id[0:7], err)
-		}
 	}
 
 	return nil
@@ -138,16 +107,12 @@ func (d *driver) peerDelete(nid, eid string, peerIP net.IP, peerIPMask net.IPMas
 	}
 
 	if updateDb {
-		_, err := hcsshim.HNSEndpointRequest("DELETE", ep.profileId, "")
+		_, err := endpointRequest("DELETE", ep.profileID, "")
 		if err != nil {
 			return err
 		}
 
 		n.deleteEndpoint(eid)
-
-		if err := d.deleteEndpointFromStore(ep); err != nil {
-			logrus.Debugf("Failed to delete stale overlay endpoint (%s) from store", ep.id[0:7])
-		}
 	}
 
 	return nil

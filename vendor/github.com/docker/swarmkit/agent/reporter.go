@@ -1,12 +1,12 @@
 package agent
 
 import (
+	"context"
 	"reflect"
 	"sync"
 
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/log"
-	"golang.org/x/net/context"
 )
 
 // StatusReporter receives updates to task status. Method may be called
@@ -115,7 +115,7 @@ func (sr *statusReporter) run(ctx context.Context) {
 			}
 
 			if err != nil {
-				log.G(ctx).WithError(err).Error("failed reporting status to agent")
+				log.G(ctx).WithError(err).Error("status reporter failed to report status to agent")
 
 				// place it back in the map, if not there, allowing us to pick
 				// the value if a new one came in when we were sending the last

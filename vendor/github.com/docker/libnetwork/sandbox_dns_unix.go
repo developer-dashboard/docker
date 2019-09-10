@@ -11,10 +11,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/etchosts"
 	"github.com/docker/libnetwork/resolvconf"
+	"github.com/docker/libnetwork/resolvconf/dns"
 	"github.com/docker/libnetwork/types"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -66,11 +67,7 @@ func (sb *sandbox) setupResolutionFiles() error {
 		return err
 	}
 
-	if err := sb.setupDNS(); err != nil {
-		return err
-	}
-
-	return nil
+	return sb.setupDNS()
 }
 
 func (sb *sandbox) buildHostsFile() error {
@@ -84,7 +81,9 @@ func (sb *sandbox) buildHostsFile() error {
 	}
 
 	// This is for the host mode networking
-	if sb.config.originHostsPath != "" {
+	if sb.config.useDefaultSandBox && len(sb.config.extraHosts) == 0 {
+		// We are working under the assumption that the origin file option had been properly expressed by the upper layer
+		// if not here we are going to error out
 		if err := copyFile(sb.config.originHostsPath, sb.config.hostsPath); err != nil && !os.IsNotExist(err) {
 			return types.InternalErrorf("could not copy source hosts file %s to %s: %v", sb.config.originHostsPath, sb.config.hostsPath, err)
 		}
@@ -100,8 +99,6 @@ func (sb *sandbox) buildHostsFile() error {
 }
 
 func (sb *sandbox) updateHostsFile(ifaceIP string) error {
-	var mhost string
-
 	if ifaceIP == "" {
 		return nil
 	}
@@ -110,11 +107,17 @@ func (sb *sandbox) updateHostsFile(ifaceIP string) error {
 		return nil
 	}
 
+	// User might have provided a FQDN in hostname or split it across hostname
+	// and domainname.  We want the FQDN and the bare hostname.
+	fqdn := sb.config.hostName
+	mhost := sb.config.hostName
 	if sb.config.domainName != "" {
-		mhost = fmt.Sprintf("%s.%s %s", sb.config.hostName, sb.config.domainName,
-			sb.config.hostName)
-	} else {
-		mhost = sb.config.hostName
+		fqdn = fmt.Sprintf("%s.%s", fqdn, sb.config.domainName)
+	}
+
+	parts := strings.SplitN(fqdn, ".", 2)
+	if len(parts) == 2 {
+		mhost = fmt.Sprintf("%s %s", fqdn, parts[0])
 	}
 
 	extraContent := []etchosts.Record{{Hosts: mhost, IP: ifaceIP}}
@@ -161,6 +164,20 @@ func (sb *sandbox) restorePath() {
 	}
 }
 
+func (sb *sandbox) setExternalResolvers(content []byte, addrType int, checkLoopback bool) {
+	servers := resolvconf.GetNameservers(content, addrType)
+	for _, ip := range servers {
+		hostLoopback := false
+		if checkLoopback {
+			hostLoopback = dns.IsIPv4Localhost(ip)
+		}
+		sb.extDNS = append(sb.extDNS, extDNSEntry{
+			IPStr:        ip,
+			HostLoopback: hostLoopback,
+		})
+	}
+}
+
 func (sb *sandbox) setupDNS() error {
 	var newRC *resolvconf.File
 
@@ -175,17 +192,39 @@ func (sb *sandbox) setupDNS() error {
 		return err
 	}
 
-	// This is for the host mode networking
-	if sb.config.originResolvConfPath != "" {
+	// When the user specify a conainter in the host namespace and do no have any dns option specified
+	// we just copy the host resolv.conf from the host itself
+	if sb.config.useDefaultSandBox &&
+		len(sb.config.dnsList) == 0 && len(sb.config.dnsSearchList) == 0 && len(sb.config.dnsOptionsList) == 0 {
+
+		// We are working under the assumption that the origin file option had been properly expressed by the upper layer
+		// if not here we are going to error out
 		if err := copyFile(sb.config.originResolvConfPath, sb.config.resolvConfPath); err != nil {
-			return fmt.Errorf("could not copy source resolv.conf file %s to %s: %v", sb.config.originResolvConfPath, sb.config.resolvConfPath, err)
+			if !os.IsNotExist(err) {
+				return fmt.Errorf("could not copy source resolv.conf file %s to %s: %v", sb.config.originResolvConfPath, sb.config.resolvConfPath, err)
+			}
+			logrus.Infof("%s does not exist, we create an empty resolv.conf for container", sb.config.originResolvConfPath)
+			if err := createFile(sb.config.resolvConfPath); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
 
-	currRC, err := resolvconf.Get()
+	originResolvConfPath := sb.config.originResolvConfPath
+	if originResolvConfPath == "" {
+		// fallback if not specified
+		originResolvConfPath = resolvconf.Path()
+	}
+	currRC, err := resolvconf.GetSpecific(originResolvConfPath)
 	if err != nil {
-		return err
+		if !os.IsNotExist(err) {
+			return err
+		}
+		// it's ok to continue if /etc/resolv.conf doesn't exist, default resolvers (Google's Public DNS)
+		// will be used
+		currRC = &resolvconf.File{}
+		logrus.Infof("/etc/resolv.conf does not exist")
 	}
 
 	if len(sb.config.dnsList) > 0 || len(sb.config.dnsSearchList) > 0 || len(sb.config.dnsOptionsList) > 0 {
@@ -208,7 +247,17 @@ func (sb *sandbox) setupDNS() error {
 		if err != nil {
 			return err
 		}
+		// After building the resolv.conf from the user config save the
+		// external resolvers in the sandbox. Note that --dns 127.0.0.x
+		// config refers to the loopback in the container namespace
+		sb.setExternalResolvers(newRC.Content, types.IPv4, false)
 	} else {
+		// If the host resolv.conf file has 127.0.0.x container should
+		// use the host resolver for queries. This is supported by the
+		// docker embedded DNS server. Hence save the external resolvers
+		// before filtering it out.
+		sb.setExternalResolvers(currRC.Content, types.IPv4, true)
+
 		// Replace any localhost/127.* (at this point we have no info about ipv6, pass it as true)
 		if newRC, err = resolvconf.FilterResolvDNS(currRC.Content, true); err != nil {
 			return err
@@ -234,7 +283,7 @@ func (sb *sandbox) updateDNS(ipv6Enabled bool) error {
 	)
 
 	// This is for the host mode networking
-	if sb.config.originResolvConfPath != "" {
+	if sb.config.useDefaultSandBox {
 		return nil
 	}
 
@@ -297,7 +346,6 @@ func (sb *sandbox) updateDNS(ipv6Enabled bool) error {
 
 // Embedded DNS server has to be enabled for this sandbox. Rebuild the container's
 // resolv.conf by doing the following
-// - Save the external name servers in resolv.conf in the sandbox
 // - Add only the embedded server's IP to container's resolv.conf
 // - If the embedded server needs any resolv.conf options add it to the current list
 func (sb *sandbox) rebuildDNS() error {
@@ -306,10 +354,9 @@ func (sb *sandbox) rebuildDNS() error {
 		return err
 	}
 
-	// localhost entries have already been filtered out from the list
-	// retain only the v4 servers in sb for forwarding the DNS queries
-	sb.extDNS = resolvconf.GetNameservers(currRC.Content, types.IPv4)
-
+	if len(sb.extDNS) == 0 {
+		sb.setExternalResolvers(currRC.Content, types.IPv4, false)
+	}
 	var (
 		dnsList        = []string{sb.resolver.NameServer()}
 		dnsOptionsList = resolvconf.GetOptions(currRC.Content)
@@ -334,17 +381,24 @@ dnsOpt:
 						return fmt.Errorf("invalid ndots option %v", option)
 					}
 					if num, err := strconv.Atoi(parts[1]); err != nil {
-						return fmt.Errorf("invalid number for ndots option %v", option)
-					} else if num > 0 {
+						return fmt.Errorf("invalid number for ndots option: %v", parts[1])
+					} else if num >= 0 {
+						// if the user sets ndots, use the user setting
 						sb.ndotsSet = true
 						break dnsOpt
+					} else {
+						return fmt.Errorf("invalid number for ndots option: %v", num)
 					}
 				}
 			}
 		}
 	}
 
-	dnsOptionsList = append(dnsOptionsList, resOptions...)
+	if !sb.ndotsSet {
+		// if the user did not set the ndots, set it to 0 to prioritize the service name resolution
+		// Ref: https://linux.die.net/man/5/resolv.conf
+		dnsOptionsList = append(dnsOptionsList, resOptions...)
+	}
 
 	_, err = resolvconf.Build(sb.config.resolvConfPath, dnsList, dnsSearchList, dnsOptionsList)
 	return err

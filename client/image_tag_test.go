@@ -1,14 +1,15 @@
-package client
+package client // import "github.com/docker/docker/client"
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
+	"github.com/docker/docker/errdefs"
 )
 
 func TestImageTagError(t *testing.T) {
@@ -20,9 +21,12 @@ func TestImageTagError(t *testing.T) {
 	if err == nil || err.Error() != "Error response from daemon: Server error" {
 		t.Fatalf("expected a Server Error, got %v", err)
 	}
+	if !errdefs.IsSystem(err) {
+		t.Fatalf("expected a Server Error, got %T", err)
+	}
 }
 
-// Note: this is not testing all the InvalidReference as it's the reponsability
+// Note: this is not testing all the InvalidReference as it's the responsibility
 // of distribution/reference package.
 func TestImageTagInvalidReference(t *testing.T) {
 	client := &Client{
@@ -30,8 +34,30 @@ func TestImageTagInvalidReference(t *testing.T) {
 	}
 
 	err := client.ImageTag(context.Background(), "image_id", "aa/asdf$$^/aa")
-	if err == nil || err.Error() != `Error parsing reference: "aa/asdf$$^/aa" is not a valid repository/tag` {
+	if err == nil || err.Error() != `Error parsing reference: "aa/asdf$$^/aa" is not a valid repository/tag: invalid reference format` {
 		t.Fatalf("expected ErrReferenceInvalidFormat, got %v", err)
+	}
+}
+
+func TestImageTagInvalidSourceImageName(t *testing.T) {
+	client := &Client{
+		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
+	}
+
+	err := client.ImageTag(context.Background(), "invalid_source_image_name_", "repo:tag")
+	if err == nil || err.Error() != "Error parsing reference: \"invalid_source_image_name_\" is not a valid repository/tag: invalid reference format" {
+		t.Fatalf("expected Parsing Reference Error, got %v", err)
+	}
+}
+
+func TestImageTagHexSource(t *testing.T) {
+	client := &Client{
+		client: newMockClient(errorMock(http.StatusOK, "OK")),
+	}
+
+	err := client.ImageTag(context.Background(), "0d409d33b27e47423b049f7f863faa08655a8c901749c2b25b93ca67d01a470d", "repo:tag")
+	if err != nil {
+		t.Fatalf("got error: %v", err)
 	}
 }
 

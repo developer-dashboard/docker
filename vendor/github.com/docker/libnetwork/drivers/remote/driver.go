@@ -4,13 +4,15 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/plugins"
 	"github.com/docker/libnetwork/datastore"
 	"github.com/docker/libnetwork/discoverapi"
 	"github.com/docker/libnetwork/driverapi"
 	"github.com/docker/libnetwork/drivers/remote/api"
 	"github.com/docker/libnetwork/types"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type driver struct {
@@ -29,12 +31,7 @@ func newDriver(name string, client *plugins.Client) driverapi.Driver {
 // Init makes sure a remote driver is registered when a network driver
 // plugin is activated.
 func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
-	// Unit test code is unaware of a true PluginStore. So we fall back to v1 plugins.
-	handleFunc := plugins.Handle
-	if pg := dc.GetPluginGetter(); pg != nil {
-		handleFunc = pg.Handle
-	}
-	handleFunc(driverapi.NetworkPluginEndpointType, func(name string, client *plugins.Client) {
+	newPluginHandler := func(name string, client *plugins.Client) {
 		// negotiate driver capability with client
 		d := newDriver(name, client)
 		c, err := d.(*driver).getCapabilities()
@@ -45,8 +42,46 @@ func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
 		if err = dc.RegisterDriver(name, d, *c); err != nil {
 			logrus.Errorf("error registering driver for %s due to %v", name, err)
 		}
-	})
+	}
+
+	// Unit test code is unaware of a true PluginStore. So we fall back to v1 plugins.
+	handleFunc := plugins.Handle
+	if pg := dc.GetPluginGetter(); pg != nil {
+		handleFunc = pg.Handle
+		activePlugins := pg.GetAllManagedPluginsByCap(driverapi.NetworkPluginEndpointType)
+		for _, ap := range activePlugins {
+			client, err := getPluginClient(ap)
+			if err != nil {
+				return err
+			}
+			newPluginHandler(ap.Name(), client)
+		}
+	}
+	handleFunc(driverapi.NetworkPluginEndpointType, newPluginHandler)
+
 	return nil
+}
+
+func getPluginClient(p plugingetter.CompatPlugin) (*plugins.Client, error) {
+	if v1, ok := p.(plugingetter.PluginWithV1Client); ok {
+		return v1.Client(), nil
+	}
+
+	pa, ok := p.(plugingetter.PluginAddr)
+	if !ok {
+		return nil, errors.Errorf("unknown plugin type %T", p)
+	}
+
+	if pa.Protocol() != plugins.ProtocolSchemeHTTPV1 {
+		return nil, errors.Errorf("unsupported plugin protocol %s", pa.Protocol())
+	}
+
+	addr := pa.Addr()
+	client, err := plugins.NewClientWithTimeout(addr.Network()+"://"+addr.String(), nil, pa.Timeout())
+	if err != nil {
+		return nil, errors.Wrap(err, "error creating plugin client")
+	}
+	return client, nil
 }
 
 // Get capability from client
@@ -62,6 +97,17 @@ func (d *driver) getCapabilities() (*driverapi.Capability, error) {
 		c.DataScope = datastore.GlobalScope
 	case "local":
 		c.DataScope = datastore.LocalScope
+	default:
+		return nil, fmt.Errorf("invalid capability: expecting 'local' or 'global', got %s", capResp.Scope)
+	}
+
+	switch capResp.ConnectivityScope {
+	case "global":
+		c.ConnectivityScope = datastore.GlobalScope
+	case "local":
+		c.ConnectivityScope = datastore.LocalScope
+	case "":
+		c.ConnectivityScope = c.DataScope
 	default:
 		return nil, fmt.Errorf("invalid capability: expecting 'local' or 'global', got %s", capResp.Scope)
 	}
@@ -108,6 +154,10 @@ func (d *driver) NetworkFree(id string) error {
 func (d *driver) EventNotify(etype driverapi.EventType, nid, tableName, key string, value []byte) {
 }
 
+func (d *driver) DecodeTableEntry(tablename string, key string, value []byte) (string, map[string]string) {
+	return "", nil
+}
+
 func (d *driver) CreateNetwork(id string, options map[string]interface{}, nInfo driverapi.NetworkInfo, ipV4Data, ipV6Data []driverapi.IPAMData) error {
 	create := &api.CreateNetworkRequest{
 		NetworkID: id,
@@ -125,7 +175,7 @@ func (d *driver) DeleteNetwork(nid string) error {
 
 func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo, epOptions map[string]interface{}) error {
 	if ifInfo == nil {
-		return fmt.Errorf("must not be called with nil InterfaceInfo")
+		return errors.New("must not be called with nil InterfaceInfo")
 	}
 
 	reqIface := &api.EndpointInterface{}
@@ -303,6 +353,10 @@ func (d *driver) RevokeExternalConnectivity(nid, eid string) error {
 
 func (d *driver) Type() string {
 	return d.networkType
+}
+
+func (d *driver) IsBuiltIn() bool {
+	return false
 }
 
 // DiscoverNew is a notification for a new discovery event, such as a new node joining a cluster

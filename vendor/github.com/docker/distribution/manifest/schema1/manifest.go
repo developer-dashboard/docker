@@ -5,9 +5,9 @@ import (
 	"fmt"
 
 	"github.com/docker/distribution"
-	"github.com/docker/distribution/digest"
 	"github.com/docker/distribution/manifest"
 	"github.com/docker/libtrust"
+	"github.com/opencontainers/go-digest"
 )
 
 const (
@@ -108,7 +108,7 @@ type SignedManifest struct {
 
 // UnmarshalJSON populates a new SignedManifest struct from JSON data.
 func (sm *SignedManifest) UnmarshalJSON(b []byte) error {
-	sm.all = make([]byte, len(b), len(b))
+	sm.all = make([]byte, len(b))
 	// store manifest and signatures in all
 	copy(sm.all, b)
 
@@ -124,7 +124,7 @@ func (sm *SignedManifest) UnmarshalJSON(b []byte) error {
 	}
 
 	// sm.Canonical stores the canonical manifest JSON
-	sm.Canonical = make([]byte, len(bytes), len(bytes))
+	sm.Canonical = make([]byte, len(bytes))
 	copy(sm.Canonical, bytes)
 
 	// Unmarshal canonical JSON into Manifest object
@@ -138,7 +138,7 @@ func (sm *SignedManifest) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// References returnes the descriptors of this manifests references
+// References returns the descriptors of this manifests references
 func (sm SignedManifest) References() []distribution.Descriptor {
 	dependencies := make([]distribution.Descriptor, len(sm.FSLayers))
 	for i, fsLayer := range sm.FSLayers {

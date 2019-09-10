@@ -1,24 +1,23 @@
 package agent
 
 import (
+	"context"
 	"errors"
+	"math"
 	"sync"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/swarmkit/api"
+	"github.com/docker/swarmkit/connectionbroker"
 	"github.com/docker/swarmkit/log"
-	"github.com/docker/swarmkit/protobuf/ptypes"
-	"github.com/docker/swarmkit/remotes"
-	"golang.org/x/net/context"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-const dispatcherRPCTimeout = 5 * time.Second
-
 var (
-	errSessionDisconnect = errors.New("agent: session disconnect") // instructed to disconnect
+	dispatcherRPCTimeout = 5 * time.Second
 	errSessionClosed     = errors.New("agent: session closed")
 )
 
@@ -30,8 +29,7 @@ var (
 // flow into the agent, such as task assignment, are called back into the
 // agent through errs, messages and tasks.
 type session struct {
-	conn *grpc.ClientConn
-	addr string
+	conn *connectionbroker.Conn
 
 	agent         *Agent
 	sessionID     string
@@ -41,12 +39,14 @@ type session struct {
 	assignments   chan *api.AssignmentsMessage
 	subscriptions chan *api.SubscriptionMessage
 
+	cancel     func()        // this is assumed to be never nil, and set whenever a session is created
 	registered chan struct{} // closed registration
 	closed     chan struct{}
 	closeOnce  sync.Once
 }
 
 func newSession(ctx context.Context, agent *Agent, delay time.Duration, sessionID string, description *api.NodeDescription) *session {
+	sessionCtx, sessionCancel := context.WithCancel(ctx)
 	s := &session{
 		agent:         agent,
 		sessionID:     sessionID,
@@ -56,33 +56,41 @@ func newSession(ctx context.Context, agent *Agent, delay time.Duration, sessionI
 		subscriptions: make(chan *api.SubscriptionMessage),
 		registered:    make(chan struct{}),
 		closed:        make(chan struct{}),
+		cancel:        sessionCancel,
 	}
 
 	// TODO(stevvooe): Need to move connection management up a level or create
 	// independent connection for log broker client.
 
-	peer, err := agent.config.Managers.Select()
-	if err != nil {
-		s.errs <- err
-		return s
-	}
-	cc, err := grpc.Dial(peer.Addr,
+	cc, err := agent.config.ConnBroker.Select(
 		grpc.WithTransportCredentials(agent.config.Credentials),
 		grpc.WithTimeout(dispatcherRPCTimeout),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 	)
+
 	if err != nil {
-		s.errs <- err
+		// since we are returning without launching the session goroutine, we
+		// need to provide the delay that is guaranteed by calling this
+		// function. We launch a goroutine so that we only delay the retry and
+		// avoid blocking the main loop.
+		go func() {
+			time.Sleep(delay)
+			s.errs <- err
+		}()
 		return s
 	}
-	s.addr = peer.Addr
+
+	log.G(ctx).Infof("manager selected by agent for new session: %v", cc.Peer())
+
 	s.conn = cc
 
-	go s.run(ctx, delay, description)
+	go s.run(sessionCtx, delay, description)
 	return s
 }
 
 func (s *session) run(ctx context.Context, delay time.Duration, description *api.NodeDescription) {
 	timer := time.NewTimer(delay) // delay before registering.
+	log.G(ctx).Infof("waiting %v before registering session", delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -122,12 +130,20 @@ func (s *session) start(ctx context.Context, description *api.NodeDescription) e
 	// Note: we don't defer cancellation of this context, because the
 	// streaming RPC is used after this function returned. We only cancel
 	// it in the timeout case to make sure the goroutine completes.
-	sessionCtx, cancelSession := context.WithCancel(ctx)
+
+	// We also fork this context again from the `run` context, because on
+	// `dispatcherRPCTimeout`, we want to cancel establishing a session and
+	// return an error.  If we cancel the `run` context instead of forking,
+	// then in `run` it's possible that we just terminate the function because
+	// `ctx` is done and hence fail to propagate the timeout error to the agent.
+	// If the error is not propogated to the agent, the agent will not close
+	// the session or rebuild a new session.
+	sessionCtx, cancelSession := context.WithCancel(ctx) //nolint:govet
 
 	// Need to run Session in a goroutine since there's no way to set a
 	// timeout for an individual Recv call in a stream.
 	go func() {
-		client := api.NewDispatcherClient(s.conn)
+		client := api.NewDispatcherClient(s.conn.ClientConn)
 
 		stream, err = client.Session(sessionCtx, &api.SessionRequest{
 			Description: description,
@@ -145,7 +161,7 @@ func (s *session) start(ctx context.Context, description *api.NodeDescription) e
 	select {
 	case err := <-errChan:
 		if err != nil {
-			return err
+			return err //nolint:govet
 		}
 	case <-time.After(dispatcherRPCTimeout):
 		cancelSession()
@@ -160,32 +176,38 @@ func (s *session) start(ctx context.Context, description *api.NodeDescription) e
 
 func (s *session) heartbeat(ctx context.Context) error {
 	log.G(ctx).Debugf("(*session).heartbeat")
-	client := api.NewDispatcherClient(s.conn)
+	client := api.NewDispatcherClient(s.conn.ClientConn)
 	heartbeat := time.NewTimer(1) // send out a heartbeat right away
 	defer heartbeat.Stop()
+
+	fields := logrus.Fields{
+		"sessionID": s.sessionID,
+		"method":    "(*session).heartbeat",
+	}
 
 	for {
 		select {
 		case <-heartbeat.C:
 			heartbeatCtx, cancel := context.WithTimeout(ctx, dispatcherRPCTimeout)
+			// TODO(anshul) log manager info in all logs in this function.
+			log.G(ctx).WithFields(fields).Debugf("sending heartbeat to manager %v with timeout %v", s.conn.Peer(), dispatcherRPCTimeout)
 			resp, err := client.Heartbeat(heartbeatCtx, &api.HeartbeatRequest{
 				SessionID: s.sessionID,
 			})
 			cancel()
 			if err != nil {
-				if grpc.Code(err) == codes.NotFound {
+				log.G(ctx).WithFields(fields).WithError(err).Errorf("heartbeat to manager %v failed", s.conn.Peer())
+				st, _ := status.FromError(err)
+				if st.Code() == codes.NotFound {
 					err = errNodeNotRegistered
 				}
 
 				return err
 			}
 
-			period, err := ptypes.Duration(&resp.Period)
-			if err != nil {
-				return err
-			}
+			log.G(ctx).WithFields(fields).Debugf("heartbeat successful to manager %v, next heartbeat period: %v", s.conn.Peer(), resp.Period)
 
-			heartbeat.Reset(period)
+			heartbeat.Reset(resp.Period)
 		case <-s.closed:
 			return errSessionClosed
 		case <-ctx.Done():
@@ -224,7 +246,7 @@ func (s *session) logSubscriptions(ctx context.Context) error {
 	log := log.G(ctx).WithFields(logrus.Fields{"method": "(*session).logSubscriptions"})
 	log.Debugf("")
 
-	client := api.NewLogBrokerClient(s.conn)
+	client := api.NewLogBrokerClient(s.conn.ClientConn)
 	subscriptions, err := client.ListenSubscriptions(ctx, &api.ListenSubscriptionsRequest{})
 	if err != nil {
 		return err
@@ -233,7 +255,8 @@ func (s *session) logSubscriptions(ctx context.Context) error {
 
 	for {
 		resp, err := subscriptions.Recv()
-		if grpc.Code(err) == codes.Unimplemented {
+		st, _ := status.FromError(err)
+		if st.Code() == codes.Unimplemented {
 			log.Warning("manager does not support log subscriptions")
 			// Don't return, because returning would bounce the session
 			select {
@@ -269,7 +292,7 @@ func (s *session) watch(ctx context.Context) error {
 		err             error
 	)
 
-	client := api.NewDispatcherClient(s.conn)
+	client := api.NewDispatcherClient(s.conn.ClientConn)
 	for {
 		// If this is the first time we're running the loop, or there was a reference mismatch
 		// attempt to get the assignmentWatch
@@ -284,7 +307,8 @@ func (s *session) watch(ctx context.Context) error {
 			// If we get a code = 12 desc = unknown method Assignments, try to use tasks
 			resp, err = assignmentWatch.Recv()
 			if err != nil {
-				if grpc.Code(err) != codes.Unimplemented {
+				st, _ := status.FromError(err)
+				if st.Code() != codes.Unimplemented {
 					return err
 				}
 				tasksFallback = true
@@ -343,20 +367,21 @@ func (s *session) watch(ctx context.Context) error {
 }
 
 // sendTaskStatus uses the current session to send the status of a single task.
-func (s *session) sendTaskStatus(ctx context.Context, taskID string, status *api.TaskStatus) error {
-	client := api.NewDispatcherClient(s.conn)
+func (s *session) sendTaskStatus(ctx context.Context, taskID string, taskStatus *api.TaskStatus) error {
+	client := api.NewDispatcherClient(s.conn.ClientConn)
 	if _, err := client.UpdateTaskStatus(ctx, &api.UpdateTaskStatusRequest{
 		SessionID: s.sessionID,
 		Updates: []*api.UpdateTaskStatusRequest_TaskStatusUpdate{
 			{
 				TaskID: taskID,
-				Status: status,
+				Status: taskStatus,
 			},
 		},
 	}); err != nil {
 		// TODO(stevvooe): Dispatcher should not return this error. Status
 		// reports for unknown tasks should be ignored.
-		if grpc.Code(err) == codes.NotFound {
+		st, _ := status.FromError(err)
+		if st.Code() == codes.NotFound {
 			return errTaskUnknown
 		}
 
@@ -385,7 +410,7 @@ func (s *session) sendTaskStatuses(ctx context.Context, updates ...*api.UpdateTa
 		return updates, ctx.Err()
 	}
 
-	client := api.NewDispatcherClient(s.conn)
+	client := api.NewDispatcherClient(s.conn.ClientConn)
 	n := batchSize
 
 	if len(updates) < n {
@@ -411,15 +436,14 @@ func (s *session) sendError(err error) {
 	}
 }
 
-// close closing session. It should be called only in <-session.errs branch
-// of event loop.
+// close the given session. It should be called only in <-session.errs branch
+// of event loop, or when cleaning up the agent.
 func (s *session) close() error {
 	s.closeOnce.Do(func() {
+		s.cancel()
 		if s.conn != nil {
-			s.agent.config.Managers.ObserveIfExists(api.Peer{Addr: s.addr}, -remotes.DefaultObservationWeight)
-			s.conn.Close()
+			s.conn.Close(false)
 		}
-
 		close(s.closed)
 	})
 

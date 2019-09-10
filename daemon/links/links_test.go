@@ -1,4 +1,4 @@
-package links
+package links // import "github.com/docker/docker/daemon/links"
 
 import (
 	"fmt"
@@ -33,7 +33,7 @@ func TestLinkNaming(t *testing.T) {
 	value, ok := env["DOCKER_1_PORT"]
 
 	if !ok {
-		t.Fatalf("DOCKER_1_PORT not found in env")
+		t.Fatal("DOCKER_1_PORT not found in env")
 	}
 
 	if value != "tcp://172.0.17.2:6379" {

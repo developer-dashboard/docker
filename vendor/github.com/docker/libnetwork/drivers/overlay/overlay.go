@@ -3,11 +3,11 @@ package overlay
 //go:generate protoc -I.:../../Godeps/_workspace/src/github.com/gogo/protobuf  --gogo_out=import_path=github.com/docker/libnetwork/drivers/overlay,Mgogoproto/gogo.proto=github.com/gogo/protobuf/gogoproto:. overlay.proto
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/datastore"
 	"github.com/docker/libnetwork/discoverapi"
 	"github.com/docker/libnetwork/driverapi"
@@ -16,6 +16,7 @@ import (
 	"github.com/docker/libnetwork/osl"
 	"github.com/docker/libnetwork/types"
 	"github.com/hashicorp/serf/serf"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -24,7 +25,6 @@ const (
 	vethLen      = 7
 	vxlanIDStart = 256
 	vxlanIDEnd   = (1 << 24) - 1
-	vxlanPort    = 4789
 	vxlanEncap   = 50
 	secureOption = "encrypted"
 )
@@ -46,25 +46,35 @@ type driver struct {
 	store            datastore.DataStore
 	localStore       datastore.DataStore
 	vxlanIdm         *idm.Idm
-	once             sync.Once
+	initOS           sync.Once
 	joinOnce         sync.Once
+	localJoinOnce    sync.Once
 	keys             []*key
+	peerOpCh         chan *peerOperation
+	peerOpCancel     context.CancelFunc
 	sync.Mutex
 }
 
 // Init registers a new instance of overlay driver
 func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
 	c := driverapi.Capability{
-		DataScope: datastore.GlobalScope,
+		DataScope:         datastore.GlobalScope,
+		ConnectivityScope: datastore.GlobalScope,
 	}
 	d := &driver{
 		networks: networkTable{},
 		peerDb: peerNetworkMap{
 			mp: map[string]*peerMap{},
 		},
-		secMap: &encrMap{nodes: map[string][]*spi{}},
-		config: config,
+		secMap:   &encrMap{nodes: map[string][]*spi{}},
+		config:   config,
+		peerOpCh: make(chan *peerOperation),
 	}
+
+	// Launch the go routine for processing peer operations
+	ctx, cancel := context.WithCancel(context.Background())
+	d.peerOpCancel = cancel
+	go d.peerOpRoutine(ctx, d.peerOpCh)
 
 	if data, ok := config[netlabel.GlobalKVClient]; ok {
 		var err error
@@ -94,17 +104,6 @@ func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
 		logrus.Warnf("Failure during overlay endpoints restore: %v", err)
 	}
 
-	// If an error happened when the network join the sandbox during the endpoints restore
-	// we should reset it now along with the once variable, so that subsequent endpoint joins
-	// outside of the restore path can potentially fix the network join and succeed.
-	for nid, n := range d.networks {
-		if n.initErr != nil {
-			logrus.Infof("resetting init error and once variable for network %s after unsuccessful endpoint restore: %v", nid, n.initErr)
-			n.initErr = nil
-			n.once = &sync.Once{}
-		}
-	}
-
 	return dc.RegisterDriver(networkType, d, c)
 }
 
@@ -126,10 +125,10 @@ func (d *driver) restoreEndpoints() error {
 		ep := kvo.(*endpoint)
 		n := d.network(ep.nid)
 		if n == nil {
-			logrus.Debugf("Network (%s) not found for restored endpoint (%s)", ep.nid[0:7], ep.id[0:7])
-			logrus.Debugf("Deleting stale overlay endpoint (%s) from store", ep.id[0:7])
+			logrus.Debugf("Network (%.7s) not found for restored endpoint (%.7s)", ep.nid, ep.id)
+			logrus.Debugf("Deleting stale overlay endpoint (%.7s) from store", ep.id)
 			if err := d.deleteEndpointFromStore(ep); err != nil {
-				logrus.Debugf("Failed to delete stale overlay endpoint (%s) from store", ep.id[0:7])
+				logrus.Debugf("Failed to delete stale overlay endpoint (%.7s) from store", ep.id)
 			}
 			continue
 		}
@@ -140,26 +139,22 @@ func (d *driver) restoreEndpoints() error {
 			return fmt.Errorf("could not find subnet for endpoint %s", ep.id)
 		}
 
-		if err := n.joinSandbox(true); err != nil {
+		if err := n.joinSandbox(s, true, true); err != nil {
 			return fmt.Errorf("restore network sandbox failed: %v", err)
-		}
-
-		if err := n.joinSubnetSandbox(s, true); err != nil {
-			return fmt.Errorf("restore subnet sandbox failed for %q: %v", s.subnetIP.String(), err)
 		}
 
 		Ifaces := make(map[string][]osl.IfaceOption)
 		vethIfaceOption := make([]osl.IfaceOption, 1)
 		vethIfaceOption = append(vethIfaceOption, n.sbox.InterfaceOptions().Master(s.brName))
-		Ifaces[fmt.Sprintf("%s+%s", "veth", "veth")] = vethIfaceOption
+		Ifaces["veth+veth"] = vethIfaceOption
 
 		err := n.sbox.Restore(Ifaces, nil, nil, nil)
 		if err != nil {
+			n.leaveSandbox()
 			return fmt.Errorf("failed to restore overlay sandbox: %v", err)
 		}
 
-		n.incEndpointCount()
-		d.peerDbAdd(ep.nid, ep.id, ep.addr.IP, ep.addr.Mask, ep.mac, net.ParseIP(d.advertiseAddress), true)
+		d.peerAdd(ep.nid, ep.id, ep.addr.IP, ep.addr.Mask, ep.mac, net.ParseIP(d.advertiseAddress), false, false, true)
 	}
 	return nil
 }
@@ -167,6 +162,11 @@ func (d *driver) restoreEndpoints() error {
 // Fini cleans up the driver resources
 func Fini(drv driverapi.Driver) {
 	d := drv.(*driver)
+
+	// Notify the peer go routine to return
+	if d.peerOpCancel != nil {
+		d.peerOpCancel()
+	}
 
 	if d.exitCh != nil {
 		waitCh := make(chan struct{})
@@ -178,6 +178,10 @@ func Fini(drv driverapi.Driver) {
 }
 
 func (d *driver) configure() error {
+
+	// Apply OS specific kernel configs if needed
+	d.initOS.Do(applyOStweaks)
+
 	if d.store == nil {
 		return nil
 	}
@@ -211,6 +215,10 @@ func (d *driver) Type() string {
 	return networkType
 }
 
+func (d *driver) IsBuiltIn() bool {
+	return true
+}
+
 func validateSelf(node string) error {
 	advIP := net.ParseIP(node)
 	if advIP == nil {
@@ -237,10 +245,16 @@ func (d *driver) nodeJoin(advertiseAddress, bindAddress string, self bool) {
 		d.bindAddress = bindAddress
 		d.Unlock()
 
+		// If containers are already running on this network update the
+		// advertise address in the peerDB
+		d.localJoinOnce.Do(func() {
+			d.peerDBUpdateSelf()
+		})
+
 		// If there is no cluster store there is no need to start serf.
 		if d.store != nil {
 			if err := validateSelf(advertiseAddress); err != nil {
-				logrus.Warnf("%s", err.Error())
+				logrus.Warn(err.Error())
 			}
 			err := d.serfInit()
 			if err != nil {

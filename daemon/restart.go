@@ -1,10 +1,11 @@
-package daemon
+package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"fmt"
 
-	"github.com/Sirupsen/logrus"
+	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
+	"github.com/sirupsen/logrus"
 )
 
 // ContainerRestart stops and starts a container. It attempts to
@@ -34,11 +35,23 @@ func (daemon *Daemon) ContainerRestart(name string, seconds *int) error {
 // gracefully stop, before forcefully terminating the container. If
 // given a negative duration, wait forever for a graceful stop.
 func (daemon *Daemon) containerRestart(container *container.Container, seconds int) error {
+
+	// Determine isolation. If not specified in the hostconfig, use daemon default.
+	actualIsolation := container.HostConfig.Isolation
+	if containertypes.Isolation.IsDefault(actualIsolation) {
+		actualIsolation = daemon.defaultIsolation
+	}
+
 	// Avoid unnecessarily unmounting and then directly mounting
 	// the container when the container stops and then starts
-	// again
-	if err := daemon.Mount(container); err == nil {
-		defer daemon.Unmount(container)
+	// again. We do not do this for Hyper-V isolated containers
+	// (implying also on Windows) as the HCS must have exclusive
+	// access to mount the containers filesystem inside the utility
+	// VM.
+	if !containertypes.Isolation.IsHyperV(actualIsolation) {
+		if err := daemon.Mount(container); err == nil {
+			defer daemon.Unmount(container)
+		}
 	}
 
 	if container.IsRunning() {
@@ -52,7 +65,7 @@ func (daemon *Daemon) containerRestart(container *container.Container, seconds i
 		container.HostConfig.AutoRemove = autoRemove
 		// containerStop will write HostConfig to disk, we shall restore AutoRemove
 		// in disk too
-		if toDiskErr := container.ToDiskLocking(); toDiskErr != nil {
+		if toDiskErr := daemon.checkpointAndSave(container); toDiskErr != nil {
 			logrus.Errorf("Write container to disk error: %v", toDiskErr)
 		}
 

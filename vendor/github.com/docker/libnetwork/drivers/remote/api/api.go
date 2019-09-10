@@ -24,7 +24,8 @@ func (r *Response) GetError() string {
 // GetCapabilityResponse is the response of GetCapability request
 type GetCapabilityResponse struct {
 	Response
-	Scope string
+	Scope             string
+	ConnectivityScope string
 }
 
 // AllocateNetworkRequest requests allocation of new network by manager
@@ -149,7 +150,7 @@ type JoinRequest struct {
 	Options    map[string]interface{}
 }
 
-// InterfaceName is the struct represetation of a pair of devices with source
+// InterfaceName is the struct representation of a pair of devices with source
 // and destination, for the purposes of putting an endpoint into a container.
 type InterfaceName struct {
 	SrcName   string

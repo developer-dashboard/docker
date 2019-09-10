@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/plugins"
 	"github.com/docker/libnetwork/discoverapi"
 	"github.com/docker/libnetwork/ipamapi"
 	"github.com/docker/libnetwork/ipams/remote/api"
 	"github.com/docker/libnetwork/types"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type allocator struct {
@@ -31,12 +33,7 @@ func newAllocator(name string, client *plugins.Client) ipamapi.Ipam {
 // Init registers a remote ipam when its plugin is activated
 func Init(cb ipamapi.Callback, l, g interface{}) error {
 
-	// Unit test code is unaware of a true PluginStore. So we fall back to v1 plugins.
-	handleFunc := plugins.Handle
-	if pg := cb.GetPluginGetter(); pg != nil {
-		handleFunc = pg.Handle
-	}
-	handleFunc(ipamapi.PluginEndpointType, func(name string, client *plugins.Client) {
+	newPluginHandler := func(name string, client *plugins.Client) {
 		a := newAllocator(name, client)
 		if cps, err := a.(*allocator).getCapabilities(); err == nil {
 			if err := cb.RegisterIpamDriverWithCapabilities(name, a, cps); err != nil {
@@ -49,8 +46,45 @@ func Init(cb ipamapi.Callback, l, g interface{}) error {
 				logrus.Errorf("error registering remote ipam driver %s due to %v", name, err)
 			}
 		}
-	})
+	}
+
+	// Unit test code is unaware of a true PluginStore. So we fall back to v1 plugins.
+	handleFunc := plugins.Handle
+	if pg := cb.GetPluginGetter(); pg != nil {
+		handleFunc = pg.Handle
+		activePlugins := pg.GetAllManagedPluginsByCap(ipamapi.PluginEndpointType)
+		for _, ap := range activePlugins {
+			client, err := getPluginClient(ap)
+			if err != nil {
+				return err
+			}
+			newPluginHandler(ap.Name(), client)
+		}
+	}
+	handleFunc(ipamapi.PluginEndpointType, newPluginHandler)
 	return nil
+}
+
+func getPluginClient(p plugingetter.CompatPlugin) (*plugins.Client, error) {
+	if v1, ok := p.(plugingetter.PluginWithV1Client); ok {
+		return v1.Client(), nil
+	}
+
+	pa, ok := p.(plugingetter.PluginAddr)
+	if !ok {
+		return nil, errors.Errorf("unknown plugin type %T", p)
+	}
+
+	if pa.Protocol() != plugins.ProtocolSchemeHTTPV1 {
+		return nil, errors.Errorf("unsupported plugin protocol %s", pa.Protocol())
+	}
+
+	addr := pa.Addr()
+	client, err := plugins.NewClientWithTimeout(addr.Network()+"://"+addr.String(), nil, pa.Timeout())
+	if err != nil {
+		return nil, errors.Wrap(err, "error creating plugin client")
+	}
+	return client, nil
 }
 
 func (a *allocator) call(methodName string, arg interface{}, retVal PluginResponse) error {
@@ -142,4 +176,8 @@ func (a *allocator) DiscoverNew(dType discoverapi.DiscoveryType, data interface{
 // DiscoverDelete is a notification for a discovery delete event, such as a node leaving a cluster
 func (a *allocator) DiscoverDelete(dType discoverapi.DiscoveryType, data interface{}) error {
 	return nil
+}
+
+func (a *allocator) IsBuiltIn() bool {
+	return false
 }

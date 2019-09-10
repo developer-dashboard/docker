@@ -1,27 +1,25 @@
 package config
 
 import (
-	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/BurntSushi/toml"
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/discovery"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/go-connections/tlsconfig"
 	"github.com/docker/libkv/store"
 	"github.com/docker/libnetwork/cluster"
 	"github.com/docker/libnetwork/datastore"
+	"github.com/docker/libnetwork/ipamutils"
 	"github.com/docker/libnetwork/netlabel"
 	"github.com/docker/libnetwork/osl"
+	"github.com/sirupsen/logrus"
 )
 
-// restrictedNameRegex represents the regular expression which regulates the allowed network or endpoint names.
-const restrictedNameRegex = `^[\w]+[\w-. ]*[\w]+$`
-
-// RestrictedNamePattern is a regular expression to validate names against the collection of restricted characters.
-var restrictedNamePattern = regexp.MustCompile(restrictedNameRegex)
+const (
+	warningThNetworkControlPlaneMTU = 1500
+	minimumNetworkControlPlaneMTU   = 500
+)
 
 // Config encapsulates configurations of various Libnetwork components
 type Config struct {
@@ -34,15 +32,17 @@ type Config struct {
 
 // DaemonCfg represents libnetwork core configuration
 type DaemonCfg struct {
-	Debug           bool
-	Experimental    bool
-	DataDir         string
-	DefaultNetwork  string
-	DefaultDriver   string
-	Labels          []string
-	DriverCfg       map[string]interface{}
-	ClusterProvider cluster.Provider
-	DisableProvider chan struct{}
+	Debug                  bool
+	Experimental           bool
+	DataDir                string
+	ExecRoot               string
+	DefaultNetwork         string
+	DefaultDriver          string
+	Labels                 []string
+	DriverCfg              map[string]interface{}
+	ClusterProvider        cluster.Provider
+	NetworkControlPlaneMTU int
+	DefaultAddressPool     []*ipamutils.NetworkToSplit
 }
 
 // ClusterCfg represents cluster configuration
@@ -82,8 +82,7 @@ func ParseConfig(tomlCfgFile string) (*Config, error) {
 func ParseConfigOptions(cfgOptions ...Option) *Config {
 	cfg := &Config{
 		Daemon: DaemonCfg{
-			DriverCfg:       make(map[string]interface{}),
-			DisableProvider: make(chan struct{}, 10),
+			DriverCfg: make(map[string]interface{}),
 		},
 		Scopes: make(map[string]*datastore.ScopeCfg),
 	}
@@ -111,6 +110,13 @@ func OptionDefaultDriver(dd string) Option {
 	return func(c *Config) {
 		logrus.Debugf("Option DefaultDriver: %s", dd)
 		c.Daemon.DefaultDriver = strings.TrimSpace(dd)
+	}
+}
+
+// OptionDefaultAddressPoolConfig function returns an option setter for default address pool
+func OptionDefaultAddressPoolConfig(addressPool []*ipamutils.NetworkToSplit) Option {
+	return func(c *Config) {
+		c.Daemon.DefaultAddressPool = addressPool
 	}
 }
 
@@ -212,6 +218,7 @@ func OptionDataDir(dataDir string) Option {
 // OptionExecRoot function returns an option setter for exec root folder
 func OptionExecRoot(execRoot string) Option {
 	return func(c *Config) {
+		c.Daemon.ExecRoot = execRoot
 		osl.SetBasePath(execRoot)
 	}
 }
@@ -231,6 +238,21 @@ func OptionExperimental(exp bool) Option {
 	}
 }
 
+// OptionNetworkControlPlaneMTU function returns an option setter for control plane MTU
+func OptionNetworkControlPlaneMTU(exp int) Option {
+	return func(c *Config) {
+		logrus.Debugf("Network Control Plane MTU: %d", exp)
+		if exp < warningThNetworkControlPlaneMTU {
+			logrus.Warnf("Received a MTU of %d, this value is very low, the network control plane can misbehave,"+
+				" defaulting to minimum value (%d)", exp, minimumNetworkControlPlaneMTU)
+			if exp < minimumNetworkControlPlaneMTU {
+				exp = minimumNetworkControlPlaneMTU
+			}
+		}
+		c.Daemon.NetworkControlPlaneMTU = exp
+	}
+}
+
 // ProcessOptions processes options and stores it in config
 func (c *Config) ProcessOptions(options ...Option) {
 	for _, opt := range options {
@@ -240,12 +262,9 @@ func (c *Config) ProcessOptions(options ...Option) {
 	}
 }
 
-// ValidateName validates configuration objects supported by libnetwork
-func ValidateName(name string) error {
-	if !restrictedNamePattern.MatchString(name) {
-		return fmt.Errorf("%q includes invalid characters, resource name has to conform to %q", name, restrictedNameRegex)
-	}
-	return nil
+// IsValidName validates configuration objects supported by libnetwork
+func IsValidName(name string) bool {
+	return strings.TrimSpace(name) != ""
 }
 
 // OptionLocalKVProvider function returns an option setter for kvstore provider

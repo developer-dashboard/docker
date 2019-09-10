@@ -1,13 +1,12 @@
 package libnetwork
 
 import (
-	"container/heap"
 	"encoding/json"
 	"sync"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/datastore"
 	"github.com/docker/libnetwork/osl"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -27,7 +26,12 @@ type sbState struct {
 	dbExists   bool
 	Eps        []epState
 	EpPriority map[string]int
-	ExtDNS     []string
+	// external servers have to be persisted so that on restart of a live-restore
+	// enabled daemon we get the external servers for the running containers.
+	// We have two versions of ExtDNS to support upgrade & downgrade of the daemon
+	// between >=1.14 and <1.14 versions.
+	ExtDNS  []string
+	ExtDNS2 []extDNSEntry
 }
 
 func (sbs *sbState) Key() []string {
@@ -110,12 +114,18 @@ func (sbs *sbState) CopyTo(o datastore.KVObject) error {
 	dstSbs.dbExists = sbs.dbExists
 	dstSbs.EpPriority = sbs.EpPriority
 
-	for _, eps := range sbs.Eps {
-		dstSbs.Eps = append(dstSbs.Eps, eps)
-	}
+	dstSbs.Eps = append(dstSbs.Eps, sbs.Eps...)
 
+	if len(sbs.ExtDNS2) > 0 {
+		for _, dns := range sbs.ExtDNS2 {
+			dstSbs.ExtDNS2 = append(dstSbs.ExtDNS2, dns)
+			dstSbs.ExtDNS = append(dstSbs.ExtDNS, dns.IPStr)
+		}
+		return nil
+	}
 	for _, dns := range sbs.ExtDNS {
 		dstSbs.ExtDNS = append(dstSbs.ExtDNS, dns)
+		dstSbs.ExtDNS2 = append(dstSbs.ExtDNS2, extDNSEntry{IPStr: dns})
 	}
 
 	return nil
@@ -131,7 +141,11 @@ func (sb *sandbox) storeUpdate() error {
 		ID:         sb.id,
 		Cid:        sb.containerID,
 		EpPriority: sb.epPriority,
-		ExtDNS:     sb.extDNS,
+		ExtDNS2:    sb.extDNS,
+	}
+
+	for _, ext := range sb.extDNS {
+		sbs.ExtDNS = append(sbs.ExtDNS, ext.IPStr)
 	}
 
 retry:
@@ -200,12 +214,20 @@ func (c *controller) sandboxCleanup(activeSandboxes map[string]interface{}) {
 			id:                 sbs.ID,
 			controller:         sbs.c,
 			containerID:        sbs.Cid,
-			endpoints:          epHeap{},
+			endpoints:          []*endpoint{},
 			populatedEndpoints: map[string]struct{}{},
 			dbIndex:            sbs.dbIndex,
 			isStub:             true,
 			dbExists:           true,
-			extDNS:             sbs.ExtDNS,
+		}
+		// If we are restoring from a older version extDNSEntry won't have the
+		// HostLoopback field
+		if len(sbs.ExtDNS2) > 0 {
+			sb.extDNS = sbs.ExtDNS2
+		} else {
+			for _, dns := range sbs.ExtDNS {
+				sb.extDNS = append(sb.extDNS, extDNSEntry{IPStr: dns})
+			}
 		}
 
 		msg := " for cleanup"
@@ -219,11 +241,10 @@ func (c *controller) sandboxCleanup(activeSandboxes map[string]interface{}) {
 			sb.processOptions(opts...)
 			sb.restorePath()
 			create = !sb.config.useDefaultSandBox
-			heap.Init(&sb.endpoints)
 		}
 		sb.osSbox, err = osl.NewSandbox(sb.Key(), create, isRestore)
 		if err != nil {
-			logrus.Errorf("failed to create osl sandbox while trying to restore sandbox %s%s: %v", sb.ID()[0:7], msg, err)
+			logrus.Errorf("failed to create osl sandbox while trying to restore sandbox %.7s%s: %v", sb.ID(), msg, err)
 			continue
 		}
 
@@ -249,7 +270,7 @@ func (c *controller) sandboxCleanup(activeSandboxes map[string]interface{}) {
 				logrus.Errorf("failed to restore endpoint %s in %s for container %s due to %v", eps.Eid, eps.Nid, sb.ContainerID(), err)
 				continue
 			}
-			heap.Push(&sb.endpoints, ep)
+			sb.addEndpoint(ep)
 		}
 
 		if _, ok := activeSandboxes[sb.ID()]; !ok {

@@ -1,21 +1,21 @@
 package controlapi
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/manager/state/raft/membership"
 	"github.com/docker/swarmkit/manager/state/store"
-	"github.com/docker/swarmkit/protobuf/ptypes"
-	"golang.org/x/net/context"
-	"google.golang.org/grpc"
+	gogotypes "github.com/gogo/protobuf/types"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func validateNodeSpec(spec *api.NodeSpec) error {
 	if spec == nil {
-		return grpc.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
+		return status.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
 	}
 	return nil
 }
@@ -25,7 +25,7 @@ func validateNodeSpec(spec *api.NodeSpec) error {
 // - Returns `NotFound` if the Node is not found.
 func (s *Server) GetNode(ctx context.Context, request *api.GetNodeRequest) (*api.GetNodeResponse, error) {
 	if request.NodeID == "" {
-		return nil, grpc.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
+		return nil, status.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
 	}
 
 	var node *api.Node
@@ -33,7 +33,7 @@ func (s *Server) GetNode(ctx context.Context, request *api.GetNodeRequest) (*api
 		node = store.GetNode(tx, request.NodeID)
 	})
 	if node == nil {
-		return nil, grpc.Errorf(codes.NotFound, "node %s not found", request.NodeID)
+		return nil, status.Errorf(codes.NotFound, "node %s not found", request.NodeID)
 	}
 
 	if s.raft != nil {
@@ -142,11 +142,17 @@ func (s *Server) ListNodes(ctx context.Context, request *api.ListNodesRequest) (
 				return filterMatchLabels(e.Description.Engine.Labels, request.Filters.Labels)
 			},
 			func(e *api.Node) bool {
+				if len(request.Filters.NodeLabels) == 0 {
+					return true
+				}
+				return filterMatchLabels(e.Spec.Annotations.Labels, request.Filters.NodeLabels)
+			},
+			func(e *api.Node) bool {
 				if len(request.Filters.Roles) == 0 {
 					return true
 				}
 				for _, c := range request.Filters.Roles {
-					if c == e.Spec.Role {
+					if c == e.Role {
 						return true
 					}
 				}
@@ -196,7 +202,7 @@ func (s *Server) ListNodes(ctx context.Context, request *api.ListNodesRequest) (
 // - Returns an error if the update fails.
 func (s *Server) UpdateNode(ctx context.Context, request *api.UpdateNodeRequest) (*api.UpdateNodeResponse, error) {
 	if request.NodeID == "" || request.NodeVersion == nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
+		return nil, status.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
 	}
 	if err := validateNodeSpec(request.Spec); err != nil {
 		return nil, err
@@ -205,36 +211,33 @@ func (s *Server) UpdateNode(ctx context.Context, request *api.UpdateNodeRequest)
 	var (
 		node   *api.Node
 		member *membership.Member
-		demote bool
 	)
 
 	err := s.store.Update(func(tx store.Tx) error {
 		node = store.GetNode(tx, request.NodeID)
 		if node == nil {
-			return grpc.Errorf(codes.NotFound, "node %s not found", request.NodeID)
+			return status.Errorf(codes.NotFound, "node %s not found", request.NodeID)
 		}
 
 		// Demotion sanity checks.
-		if node.Spec.Role == api.NodeRoleManager && request.Spec.Role == api.NodeRoleWorker {
-			demote = true
-
+		if node.Spec.DesiredRole == api.NodeRoleManager && request.Spec.DesiredRole == api.NodeRoleWorker {
 			// Check for manager entries in Store.
 			managers, err := store.FindNodes(tx, store.ByRole(api.NodeRoleManager))
 			if err != nil {
-				return grpc.Errorf(codes.Internal, "internal store error: %v", err)
+				return status.Errorf(codes.Internal, "internal store error: %v", err)
 			}
 			if len(managers) == 1 && managers[0].ID == node.ID {
-				return grpc.Errorf(codes.FailedPrecondition, "attempting to demote the last manager of the swarm")
+				return status.Errorf(codes.FailedPrecondition, "attempting to demote the last manager of the swarm")
 			}
 
 			// Check for node in memberlist
 			if member = s.raft.GetMemberByNodeID(request.NodeID); member == nil {
-				return grpc.Errorf(codes.NotFound, "can't find manager in raft memberlist")
+				return status.Errorf(codes.NotFound, "can't find manager in raft memberlist")
 			}
 
 			// Quorum safeguard
 			if !s.raft.CanRemoveMember(member.RaftID) {
-				return grpc.Errorf(codes.FailedPrecondition, "can't remove member from the raft: this would result in a loss of quorum")
+				return status.Errorf(codes.FailedPrecondition, "can't remove member from the raft: this would result in a loss of quorum")
 			}
 		}
 
@@ -246,19 +249,30 @@ func (s *Server) UpdateNode(ctx context.Context, request *api.UpdateNodeRequest)
 		return nil, err
 	}
 
-	if demote && s.raft != nil {
-		// TODO(abronan): the remove can potentially fail and leave the node with
-		// an incorrect role (worker rather than manager), we need to reconcile the
-		// memberlist with the desired state rather than attempting to remove the
-		// member once.
-		if err := s.raft.RemoveMember(ctx, member.RaftID); err != nil {
-			return nil, grpc.Errorf(codes.Internal, "cannot demote manager to worker: %v", err)
-		}
-	}
-
 	return &api.UpdateNodeResponse{
 		Node: node,
 	}, nil
+}
+
+func orphanNodeTasks(tx store.Tx, nodeID string) error {
+	// when a node is deleted, all of its tasks are irrecoverably removed.
+	// additionally, the Dispatcher can no longer be relied on to update the
+	// task status. Therefore, when the node is removed, we must additionally
+	// move all of its assigned tasks to the Orphaned state, so that their
+	// resources can be cleaned up.
+	tasks, err := store.FindTasks(tx, store.ByNodeID(nodeID))
+	if err != nil {
+		return err
+	}
+	for _, task := range tasks {
+		task.Status = api.TaskStatus{
+			Timestamp: gogotypes.TimestampNow(),
+			State:     api.TaskStateOrphaned,
+			Message:   "Task belonged to a node that has been deleted",
+		}
+		store.UpdateTask(tx, task)
+	}
+	return nil
 }
 
 // RemoveNode removes a Node referenced by NodeID with the given NodeSpec.
@@ -268,33 +282,33 @@ func (s *Server) UpdateNode(ctx context.Context, request *api.UpdateNodeRequest)
 // - Returns an error if the delete fails.
 func (s *Server) RemoveNode(ctx context.Context, request *api.RemoveNodeRequest) (*api.RemoveNodeResponse, error) {
 	if request.NodeID == "" {
-		return nil, grpc.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
+		return nil, status.Errorf(codes.InvalidArgument, errInvalidArgument.Error())
 	}
 
 	err := s.store.Update(func(tx store.Tx) error {
 		node := store.GetNode(tx, request.NodeID)
 		if node == nil {
-			return grpc.Errorf(codes.NotFound, "node %s not found", request.NodeID)
+			return status.Errorf(codes.NotFound, "node %s not found", request.NodeID)
 		}
-		if node.Spec.Role == api.NodeRoleManager {
+		if node.Spec.DesiredRole == api.NodeRoleManager {
 			if s.raft == nil {
-				return grpc.Errorf(codes.FailedPrecondition, "node %s is a manager but cannot access node information from the raft memberlist", request.NodeID)
+				return status.Errorf(codes.FailedPrecondition, "node %s is a manager but cannot access node information from the raft memberlist", request.NodeID)
 			}
 			if member := s.raft.GetMemberByNodeID(request.NodeID); member != nil {
-				return grpc.Errorf(codes.FailedPrecondition, "node %s is a cluster manager and is a member of the raft cluster. It must be demoted to worker before removal", request.NodeID)
+				return status.Errorf(codes.FailedPrecondition, "node %s is a cluster manager and is a member of the raft cluster. It must be demoted to worker before removal", request.NodeID)
 			}
 		}
 		if !request.Force && node.Status.State == api.NodeStatus_READY {
-			return grpc.Errorf(codes.FailedPrecondition, "node %s is not down and can't be removed", request.NodeID)
+			return status.Errorf(codes.FailedPrecondition, "node %s is not down and can't be removed", request.NodeID)
 		}
 
 		// lookup the cluster
-		clusters, err := store.FindClusters(tx, store.ByName("default"))
+		clusters, err := store.FindClusters(tx, store.ByName(store.DefaultClusterName))
 		if err != nil {
 			return err
 		}
 		if len(clusters) != 1 {
-			return grpc.Errorf(codes.Internal, "could not fetch cluster object")
+			return status.Errorf(codes.Internal, "could not fetch cluster object")
 		}
 		cluster := clusters[0]
 
@@ -307,7 +321,7 @@ func (s *Server) RemoveNode(ctx context.Context, request *api.RemoveNodeRequest)
 			if certBlock != nil {
 				X509Cert, err := x509.ParseCertificate(certBlock.Bytes)
 				if err == nil && !X509Cert.NotAfter.IsZero() {
-					expiry, err := ptypes.TimestampProto(X509Cert.NotAfter)
+					expiry, err := gogotypes.TimestampProto(X509Cert.NotAfter)
 					if err == nil {
 						blacklistedCert.Expiry = expiry
 					}
@@ -323,6 +337,10 @@ func (s *Server) RemoveNode(ctx context.Context, request *api.RemoveNodeRequest)
 		expireBlacklistedCerts(cluster)
 
 		if err := store.UpdateCluster(tx, cluster); err != nil {
+			return err
+		}
+
+		if err := orphanNodeTasks(tx, request.NodeID); err != nil {
 			return err
 		}
 

@@ -5,10 +5,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/docker/libnetwork/drivers/overlay/overlayutils"
 	"github.com/docker/libnetwork/netutils"
 	"github.com/docker/libnetwork/ns"
 	"github.com/docker/libnetwork/osl"
+	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 )
@@ -61,7 +62,7 @@ func createVxlan(name string, vni uint32, mtu int) error {
 		LinkAttrs: netlink.LinkAttrs{Name: name, MTU: mtu},
 		VxlanId:   int(vni),
 		Learning:  true,
-		Port:      vxlanPort,
+		Port:      int(overlayutils.VXLANUDPPort()),
 		Proxy:     true,
 		L3miss:    true,
 		L2miss:    true,

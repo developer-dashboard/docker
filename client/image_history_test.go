@@ -1,7 +1,8 @@
-package client
+package client // import "github.com/docker/docker/client"
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -9,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"golang.org/x/net/context"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/errdefs"
 )
 
 func TestImageHistoryError(t *testing.T) {
@@ -21,6 +22,9 @@ func TestImageHistoryError(t *testing.T) {
 	if err == nil || err.Error() != "Error response from daemon: Server error" {
 		t.Fatalf("expected a Server error, got %v", err)
 	}
+	if !errdefs.IsSystem(err) {
+		t.Fatalf("expected a Server Error, got %T", err)
+	}
 }
 
 func TestImageHistory(t *testing.T) {
@@ -30,7 +34,7 @@ func TestImageHistory(t *testing.T) {
 			if !strings.HasPrefix(r.URL.Path, expectedURL) {
 				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, r.URL)
 			}
-			b, err := json.Marshal([]types.ImageHistory{
+			b, err := json.Marshal([]image.HistoryResponseItem{
 				{
 					ID:   "image_id1",
 					Tags: []string{"tag1", "tag2"},

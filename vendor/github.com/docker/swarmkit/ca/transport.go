@@ -1,6 +1,7 @@
 package ca
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -9,7 +10,6 @@ import (
 	"sync"
 
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc/credentials"
 )
 
@@ -17,12 +17,6 @@ var (
 	// alpnProtoStr is the specified application level protocols for gRPC.
 	alpnProtoStr = []string{"h2"}
 )
-
-type timeoutError struct{}
-
-func (timeoutError) Error() string   { return "mutablecredentials: Dial timed out" }
-func (timeoutError) Timeout() bool   { return true }
-func (timeoutError) Temporary() bool { return true }
 
 // MutableTLSCreds is the credentials required for authenticating a connection using TLS.
 type MutableTLSCreds struct {
@@ -48,7 +42,7 @@ func (c *MutableTLSCreds) Info() credentials.ProtocolInfo {
 // It panics if validation of underlying config fails.
 func (c *MutableTLSCreds) Clone() credentials.TransportCredentials {
 	c.Lock()
-	newCfg, err := NewMutableTLS(c.config)
+	newCfg, err := NewMutableTLS(c.config.Clone())
 	if err != nil {
 		panic("validation error on Clone")
 	}
@@ -120,8 +114,8 @@ func (c *MutableTLSCreds) ServerHandshake(rawConn net.Conn) (net.Conn, credentia
 	return conn, credentials.TLSInfo{State: conn.ConnectionState()}, nil
 }
 
-// LoadNewTLSConfig replaces the currently loaded TLS config with a new one
-func (c *MutableTLSCreds) LoadNewTLSConfig(newConfig *tls.Config) error {
+// loadNewTLSConfig replaces the currently loaded TLS config with a new one
+func (c *MutableTLSCreds) loadNewTLSConfig(newConfig *tls.Config) error {
 	newSubject, err := GetAndValidateCertificateSubject(newConfig.Certificates)
 	if err != nil {
 		return err

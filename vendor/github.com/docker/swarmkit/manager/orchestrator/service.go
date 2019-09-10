@@ -1,10 +1,11 @@
 package orchestrator
 
 import (
+	"context"
+
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/manager/state/store"
-	"golang.org/x/net/context"
 )
 
 // IsReplicatedService checks if a service is a replicated service.
@@ -27,8 +28,10 @@ func IsGlobalService(service *api.Service) bool {
 	return ok
 }
 
-// DeleteServiceTasks deletes the tasks associated with a service.
-func DeleteServiceTasks(ctx context.Context, s *store.MemoryStore, service *api.Service) {
+// SetServiceTasksRemove sets the desired state of tasks associated with a service
+// to REMOVE, so that they can be properly shut down by the agent and later removed
+// by the task reaper.
+func SetServiceTasksRemove(ctx context.Context, s *store.MemoryStore, service *api.Service) {
 	var (
 		tasks []*api.Task
 		err   error
@@ -41,11 +44,31 @@ func DeleteServiceTasks(ctx context.Context, s *store.MemoryStore, service *api.
 		return
 	}
 
-	_, err = s.Batch(func(batch *store.Batch) error {
+	err = s.Batch(func(batch *store.Batch) error {
 		for _, t := range tasks {
 			err := batch.Update(func(tx store.Tx) error {
-				if err := store.DeleteTask(tx, t.ID); err != nil {
-					log.G(ctx).WithError(err).Errorf("failed to delete task")
+				// the task may have changed for some reason in the meantime
+				// since we read it out, so we need to get from the store again
+				// within the boundaries of a transaction
+				latestTask := store.GetTask(tx, t.ID)
+
+				// time travel is not allowed. if the current desired state is
+				// above the one we're trying to go to we can't go backwards.
+				// we have nothing to do and we should skip to the next task
+				if latestTask.DesiredState > api.TaskStateRemove {
+					// log a warning, though. we shouln't be trying to rewrite
+					// a state to an earlier state
+					log.G(ctx).Warnf(
+						"cannot update task %v in desired state %v to an earlier desired state %v",
+						latestTask.ID, latestTask.DesiredState, api.TaskStateRemove,
+					)
+					return nil
+				}
+				// update desired state to REMOVE
+				latestTask.DesiredState = api.TaskStateRemove
+
+				if err := store.UpdateTask(tx, latestTask); err != nil {
+					log.G(ctx).WithError(err).Errorf("failed transaction: update task desired state to REMOVE")
 				}
 				return nil
 			})

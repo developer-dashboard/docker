@@ -21,7 +21,7 @@ exist on the repository should apply to issues.
  * `status/1-design-review`
  * `status/2-code-review`
  * `status/3-docs-review`
- * `status/4-ready-to-merge`
+ * `status/4-merge`
 
 Special status labels:
 
@@ -68,7 +68,7 @@ the next appropriate stage:
 
  - Has DCO
  - Contains sufficient justification (e.g., usecases) for the proposed change
- - References the Github issue it fixes (if any) in the commit or the first Github comment
+ - References the GitHub issue it fixes (if any) in the commit or the first GitHub comment
 
 Possible transitions from this state:
 

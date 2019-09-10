@@ -1,16 +1,16 @@
 package exec
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/api/equality"
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/protobuf/ptypes"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
+	"github.com/sirupsen/logrus"
 )
 
 // Controller controls execution of a task.
@@ -104,17 +104,22 @@ func Resolve(ctx context.Context, task *api.Task, executor Executor) (Controller
 
 	// depending on the tasks state, a failed controller resolution has varying
 	// impact. The following expresses that impact.
-	if task.Status.State < api.TaskStateStarting {
-		if err != nil {
-			// before the task has been started, we consider it a rejection.
-			status.Message = "resolving controller failed"
-			status.Err = err.Error()
+	if err != nil {
+		status.Message = "resolving controller failed"
+		status.Err = err.Error()
+		// before the task has been started, we consider it a rejection.
+		// if task is running, consider the task has failed
+		// otherwise keep the existing state
+		if task.Status.State < api.TaskStateStarting {
 			status.State = api.TaskStateRejected
-		} else if task.Status.State < api.TaskStateAccepted {
-			// we always want to proceed to accepted when we resolve the contoller
-			status.Message = "accepted"
-			status.State = api.TaskStateAccepted
+		} else if task.Status.State <= api.TaskStateRunning {
+			status.State = api.TaskStateFailed
 		}
+	} else if task.Status.State < api.TaskStateAccepted {
+		// we always want to proceed to accepted when we resolve the controller
+		status.Message = "accepted"
+		status.State = api.TaskStateAccepted
+		status.Err = ""
 	}
 
 	return ctlr, status, err
@@ -154,6 +159,7 @@ func Do(ctx context.Context, task *api.Task, ctlr Controller) (*api.TaskStatus, 
 		current := status.State
 		status.State = state
 		status.Message = msg
+		status.Err = ""
 
 		if current > state {
 			panic("invalid state transition")
@@ -282,7 +288,9 @@ func Do(ctx context.Context, task *api.Task, ctlr Controller) (*api.TaskStatus, 
 		status.PortStatus = portStatus
 	}()
 
-	if task.DesiredState == api.TaskStateShutdown {
+	// this branch bounds the largest state achievable in the agent as SHUTDOWN, which
+	// is exactly the correct behavior for the agent.
+	if task.DesiredState >= api.TaskStateShutdown {
 		if status.State >= api.TaskStateCompleted {
 			return noop()
 		}

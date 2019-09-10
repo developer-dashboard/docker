@@ -5,10 +5,12 @@ import (
 	"net"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/docker/docker/integration-cli/checker"
 	"github.com/go-check/check"
+	"gotest.tools/assert"
 )
 
 func (s *DockerSuite) TestPortList(c *check.C) {
@@ -21,13 +23,13 @@ func (s *DockerSuite) TestPortList(c *check.C) {
 
 	err := assertPortList(c, out, []string{"0.0.0.0:9876"})
 	// Port list is not correct
-	c.Assert(err, checker.IsNil)
+	assert.NilError(c, err)
 
 	out, _ = dockerCmd(c, "port", firstID)
 
 	err = assertPortList(c, out, []string{"80/tcp -> 0.0.0.0:9876"})
 	// Port list is not correct
-	c.Assert(err, checker.IsNil)
+	assert.NilError(c, err)
 
 	dockerCmd(c, "rm", "-f", firstID)
 
@@ -43,7 +45,7 @@ func (s *DockerSuite) TestPortList(c *check.C) {
 
 	err = assertPortList(c, out, []string{"0.0.0.0:9876"})
 	// Port list is not correct
-	c.Assert(err, checker.IsNil)
+	assert.NilError(c, err)
 
 	out, _ = dockerCmd(c, "port", ID)
 
@@ -52,7 +54,7 @@ func (s *DockerSuite) TestPortList(c *check.C) {
 		"81/tcp -> 0.0.0.0:9877",
 		"82/tcp -> 0.0.0.0:9878"})
 	// Port list is not correct
-	c.Assert(err, checker.IsNil)
+	assert.NilError(c, err)
 
 	dockerCmd(c, "rm", "-f", ID)
 
@@ -69,7 +71,7 @@ func (s *DockerSuite) TestPortList(c *check.C) {
 
 	err = assertPortList(c, out, []string{"0.0.0.0:9876", "0.0.0.0:9999"})
 	// Port list is not correct
-	c.Assert(err, checker.IsNil)
+	assert.NilError(c, err)
 
 	out, _ = dockerCmd(c, "port", ID)
 
@@ -79,7 +81,7 @@ func (s *DockerSuite) TestPortList(c *check.C) {
 		"81/tcp -> 0.0.0.0:9877",
 		"82/tcp -> 0.0.0.0:9878"})
 	// Port list is not correct
-	c.Assert(err, checker.IsNil)
+	assert.NilError(c, err)
 	dockerCmd(c, "rm", "-f", ID)
 
 	testRange := func() {
@@ -95,7 +97,7 @@ func (s *DockerSuite) TestPortList(c *check.C) {
 
 			err = assertPortList(c, out, []string{fmt.Sprintf("80/tcp -> 0.0.0.0:%d", 9090+i)})
 			// Port list is not correct
-			c.Assert(err, checker.IsNil)
+			assert.NilError(c, err)
 		}
 
 		// test port range exhaustion
@@ -136,7 +138,7 @@ func (s *DockerSuite) TestPortList(c *check.C) {
 		"82/tcp -> 0.0.0.0:9802",
 		"83/tcp -> 0.0.0.0:9803"})
 	// Port list is not correct
-	c.Assert(err, checker.IsNil)
+	assert.NilError(c, err)
 	dockerCmd(c, "rm", "-f", ID)
 
 	// test mixing protocols in same port range
@@ -148,11 +150,10 @@ func (s *DockerSuite) TestPortList(c *check.C) {
 
 	out, _ = dockerCmd(c, "port", ID)
 
-	err = assertPortList(c, out, []string{
-		"80/tcp -> 0.0.0.0:8000",
-		"80/udp -> 0.0.0.0:8000"})
+	// Running this test multiple times causes the TCP port to increment.
+	err = assertPortRange(c, out, []int{8000, 8080}, []int{8000, 8080})
 	// Port list is not correct
-	c.Assert(err, checker.IsNil)
+	assert.NilError(c, err)
 	dockerCmd(c, "rm", "-f", ID)
 }
 
@@ -170,6 +171,38 @@ func assertPortList(c *check.C, out string, expected []string) error {
 		}
 	}
 
+	return nil
+}
+
+func assertPortRange(c *check.C, out string, expectedTcp, expectedUdp []int) error {
+	lines := strings.Split(strings.Trim(out, "\n "), "\n")
+
+	var validTcp, validUdp bool
+	for _, l := range lines {
+		// 80/tcp -> 0.0.0.0:8015
+		port, err := strconv.Atoi(strings.Split(l, ":")[1])
+		if err != nil {
+			return err
+		}
+		if strings.Contains(l, "tcp") && expectedTcp != nil {
+			if port < expectedTcp[0] || port > expectedTcp[1] {
+				return fmt.Errorf("tcp port (%d) not in range expected range %d-%d", port, expectedTcp[0], expectedTcp[1])
+			}
+			validTcp = true
+		}
+		if strings.Contains(l, "udp") && expectedUdp != nil {
+			if port < expectedUdp[0] || port > expectedUdp[1] {
+				return fmt.Errorf("udp port (%d) not in range expected range %d-%d", port, expectedUdp[0], expectedUdp[1])
+			}
+			validUdp = true
+		}
+	}
+	if !validTcp {
+		return fmt.Errorf("tcp port not found")
+	}
+	if !validUdp {
+		return fmt.Errorf("udp port not found")
+	}
 	return nil
 }
 
@@ -260,7 +293,7 @@ func (s *DockerSuite) TestPortHostBinding(c *check.C) {
 
 	err := assertPortList(c, out, []string{"0.0.0.0:9876"})
 	// Port list is not correct
-	c.Assert(err, checker.IsNil)
+	assert.NilError(c, err)
 
 	dockerCmd(c, "run", "--net=host", "busybox",
 		"nc", "localhost", "9876")

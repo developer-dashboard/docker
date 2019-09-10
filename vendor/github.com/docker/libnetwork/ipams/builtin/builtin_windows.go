@@ -3,7 +3,7 @@
 package builtin
 
 import (
-	"fmt"
+	"errors"
 
 	"github.com/docker/libnetwork/datastore"
 	"github.com/docker/libnetwork/ipam"
@@ -11,6 +11,11 @@ import (
 	"github.com/docker/libnetwork/ipamutils"
 
 	windowsipam "github.com/docker/libnetwork/ipams/windowsipam"
+)
+
+var (
+	// defaultAddressPool Stores user configured subnet list
+	defaultAddressPool []*ipamutils.NetworkToSplit
 )
 
 // InitDockerDefault registers the built-in ipam service with libnetwork
@@ -22,17 +27,17 @@ func InitDockerDefault(ic ipamapi.Callback, l, g interface{}) error {
 
 	if l != nil {
 		if localDs, ok = l.(datastore.DataStore); !ok {
-			return fmt.Errorf("incorrect local datastore passed to built-in ipam init")
+			return errors.New("incorrect local datastore passed to built-in ipam init")
 		}
 	}
 
 	if g != nil {
 		if globalDs, ok = g.(datastore.DataStore); !ok {
-			return fmt.Errorf("incorrect global datastore passed to built-in ipam init")
+			return errors.New("incorrect global datastore passed to built-in ipam init")
 		}
 	}
 
-	ipamutils.InitNetworks()
+	ipamutils.ConfigLocalScopeDefaultNetworks(nil)
 
 	a, err := ipam.NewAllocator(localDs, globalDs)
 	if err != nil {
@@ -54,4 +59,14 @@ func Init(ic ipamapi.Callback, l, g interface{}) error {
 	}
 
 	return initFunc(ic, l, g)
+}
+
+// SetDefaultIPAddressPool stores default address pool .
+func SetDefaultIPAddressPool(addressPool []*ipamutils.NetworkToSplit) {
+	defaultAddressPool = addressPool
+}
+
+// GetDefaultIPAddressPool returns default address pool .
+func GetDefaultIPAddressPool() []*ipamutils.NetworkToSplit {
+	return defaultAddressPool
 }
